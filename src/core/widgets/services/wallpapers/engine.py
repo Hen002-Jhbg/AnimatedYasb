@@ -41,6 +41,8 @@ from win32con import (
     WS_POPUP,
 )
 
+from core.utils.motion import tick_interval_ms
+
 logger = logging.getLogger("wallpaper_engine")
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
@@ -421,7 +423,6 @@ class _ImageLoader(QThread):
 
 class WallpaperEngine(QWidget):
     _ANIMATION_MS = 1200
-    _FRAME_MS = 16
 
     finished = pyqtSignal()
 
@@ -450,7 +451,9 @@ class WallpaperEngine(QWidget):
         self.winId()
 
         self._timeline = QTimeLine(self._ANIMATION_MS, self)
-        self._timeline.setUpdateInterval(self._FRAME_MS)
+        # One update per frame of the screen (4 ms at 165 Hz) instead of a fixed 16 ms; a full-screen
+        # frame paints in well under 1 ms, so the reveal edge no longer steps across the screen
+        self._timeline.setUpdateInterval(tick_interval_ms(self))
         self._timeline.setEasingCurve(QEasingCurve.Type.OutQuad)
         self._timeline.valueChanged.connect(self._on_progress)
         self._timeline.finished.connect(self._on_finished)
@@ -482,7 +485,7 @@ class WallpaperEngine(QWidget):
 
     def _start_fade_in(self) -> None:
         self._fade_timeline = QTimeLine(50, self)
-        self._fade_timeline.setUpdateInterval(self._FRAME_MS)
+        self._fade_timeline.setUpdateInterval(tick_interval_ms(self))
         self._fade_timeline.valueChanged.connect(self.setWindowOpacity)
         self._fade_timeline.finished.connect(self._on_fade_in_done)
         self._fade_timeline.start()
