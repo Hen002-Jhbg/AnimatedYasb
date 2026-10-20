@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.bar_helper import GlobalState
-from core.utils.motion import ValueMotion
+from core.utils.motion import SpringMotion
 from core.utils.win32.utils import apply_qmenu_style
 from core.utils.win32.window_actions import force_foreground_focus
 from core.widgets.services.wallpapers.images import FolderScanner, ImageLoader
@@ -31,8 +31,9 @@ from core.widgets.services.wallpapers.manager import WallpaperManager
 FADE_IN_DURATION = 80
 FADE_OUT_DURATION = 120
 
-# One arrow-key step of the carousel; on the shared strong ease-out curve (ValueMotion's default)
-CARD_ANIMATION_DURATION = 200
+# Carousel spring, critically damped (no overshoot): how long one step takes, in seconds. Holding an
+# arrow key keeps the cards gliding, because the spring keeps its speed when the target moves on.
+CARD_SPRING_RESPONSE = 0.3
 
 # Windows hit tests a translucent window per pixel, so a fully transparent gap
 # is clicked through. One step of alpha catches the click instead.
@@ -198,7 +199,7 @@ class CardsView(QWidget):
         self.hovered: int | None = None
         self.hit_areas: list[tuple[int, QPolygonF]] = []
 
-        self.animation = ValueMotion(self)
+        self.animation = SpringMotion(self, CARD_SPRING_RESPONSE)
         self.animation.valueChanged.connect(self._on_animation_value)
         self.animation.finished.connect(self._on_animation_finished)
 
@@ -402,8 +403,8 @@ class CardsView(QWidget):
             self.update()
             return
 
-        # Starts from the current offset, so fast repeated arrow presses retarget instead of jumping
-        self.animation.start(self.offset, target, CARD_ANIMATION_DURATION)
+        # A new step mid-move keeps the current speed, so repeated presses flow into one motion
+        self.animation.animate_to(target, self.offset)
 
     def move_by(self, delta: int):
         count = self.count

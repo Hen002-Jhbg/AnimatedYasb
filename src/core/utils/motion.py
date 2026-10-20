@@ -3,11 +3,13 @@
 One curve and one duration scale, so everything on the bar moves the same way.
 WindowMotion animates the top-level window itself (opacity + position), so whatever the window
 contains moves with it and nothing is resized or re-laid out while it runs. ValueMotion animates
-a single number (a scroll offset, a height) on the same curve and ticker.
+a single number (a scroll offset, a height) on the same curve and ticker. SpringMotion moves a
+number on a critically damped spring for motion that is retargeted often, like a carousel.
 """
 
 import ctypes
 import logging
+import math
 import os
 
 from PyQt6.QtCore import QElapsedTimer, QEasingCurve, QEvent, QObject, QPoint, QPointF, Qt, QTimer, pyqtSignal
@@ -276,6 +278,97 @@ class ValueMotion(QObject):
                     self._clock.elapsed() / max(1, self._ticks),
                 )
             self.finished.emit()
+
+    def _set(self, value: float) -> None:
+        self._value = value
+        self.valueChanged.emit(value)
+
+
+class SpringMotion(QObject):
+    """Moves one number toward a target on a critically damped spring (no overshoot).
+
+    Unlike ValueMotion it keeps its velocity when the target changes mid-way, so a run of quick
+    steps (an arrow key held down) glides as one continuous motion instead of restarting each time,
+    and a single step starts softly instead of jumping. `response` is Apple's term for the spring:
+    roughly how long the move takes, in seconds. With Windows "Animation effects" off it jumps.
+    """
+
+    valueChanged = pyqtSignal(float)
+    finished = pyqtSignal()
+
+    def __init__(self, widget: QWidget, response: float, precision: float = 0.001):
+        super().__init__(widget)
+        self._widget = widget
+        self._omega = 2.0 * math.pi / response
+        self._precision = precision
+        self._clock = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._tick)
+        self._value = 0.0
+        self._velocity = 0.0
+        self._target = 0.0
+        self._last_ms = 0
+        self._ticks = 0
+
+    def value(self) -> float:
+        return self._value
+
+    def velocity(self) -> float:
+        return self._velocity
+
+    def is_running(self) -> bool:
+        return self._timer.isActive()
+
+    def stop(self) -> None:
+        """Stop where it is, at rest, without emitting finished."""
+        self._timer.stop()
+        self._velocity = 0.0
+
+    def animate_to(self, target: float, start: float) -> None:
+        """Head for target. While moving, keep the current position and velocity; at rest, start from start."""
+        if not self.is_running():
+            self._value = float(start)
+            self._velocity = 0.0
+        self._target = float(target)
+        if not animations_enabled():
+            self.stop()
+            self._set(self._target)
+            self.finished.emit()
+            return
+        if not self.is_running():
+            self._timer.setInterval(tick_interval_ms(self._widget))
+            self._ticks = 0
+            self._last_ms = 0
+            self._clock.start()
+            self._timer.start()
+
+    def _tick(self) -> None:
+        now = self._clock.elapsed()
+        dt = (now - self._last_ms) / 1000.0
+        self._last_ms = now
+        self._ticks += 1
+        # Exact critically damped step from the current offset and velocity (stable for any dt)
+        w = self._omega
+        x0 = self._value - self._target
+        b = self._velocity + w * x0
+        decay = math.exp(-w * dt)
+        x = (x0 + b * dt) * decay
+        self._velocity = (self._velocity - w * b * dt) * decay
+        if abs(x) < self._precision and abs(self._velocity) < self._precision * w:
+            self.stop()
+            self._set(self._target)
+            if os.path.exists(_DEBUG_FLAG):
+                logging.info(
+                    "spring motion %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
+                    now,
+                    self._ticks,
+                    self._timer.interval(),
+                    now / max(1, self._ticks),
+                )
+            self.finished.emit()
+            return
+        self._set(self._target + x)
 
     def _set(self, value: float) -> None:
         self._value = value
