@@ -13,6 +13,7 @@ from PyQt6.QtCore import (
     QSize,
     Qt,
     QTimer,
+    pyqtSignal,
     pyqtSlot,
 )
 from PyQt6.QtGui import (
@@ -39,6 +40,7 @@ from PyQt6.QtWidgets import (
 from winrt.windows.data.xml.dom import XmlDocument
 from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager
 
+from core.utils.motion import EXIT_SLIDE_PX, POPUP_ENTER_MS, POPUP_EXIT_MS, SLIDE_PX, WindowMotion
 from core.utils.qobject import is_valid_qobject
 from core.utils.system import is_windows_10
 from core.utils.win32.backdrop import enable_blur
@@ -261,6 +263,9 @@ class PopupWidget(QWidget):
     # But this should be revisited maybe is there a better way to manage this
     _open_popups: dict[int, PopupWidget] = {}
 
+    # Emitted once the popup has finished closing (after the fade-out, or right away when not animated)
+    closed = pyqtSignal()
+
     def __init__(
         self,
         parent: QWidget,
@@ -271,6 +276,7 @@ class PopupWidget(QWidget):
         dark_mode: bool = False,
         persistent: bool = False,
         pinnable: bool = False,
+        animated: bool = True,
     ):
         super().__init__(parent)
 
@@ -299,13 +305,10 @@ class PopupWidget(QWidget):
         self._canvas = QWidget(self)
         self._popup_content = QFrame(self._canvas)
 
-        # Animations
-        self._show_animation: QPropertyAnimation = QPropertyAnimation(self._canvas, b"geometry", self)
-        self._show_animation.setDuration(300)
-
-        self._hide_animation: QPropertyAnimation = QPropertyAnimation(self._canvas, b"geometry", self)
-        self._hide_animation.setDuration(300)
-        self._hide_animation.finished.connect(self._on_hide_animation_finished)
+        # The whole window fades and slides; the canvas and content always fill it
+        self._animated = animated
+        self._motion = WindowMotion(self)
+        self._motion.finished.connect(self._on_motion_finished)
 
         self._is_closing = False
 
@@ -426,69 +429,44 @@ class PopupWidget(QWidget):
 
             try:
                 super().hide()
+                self.setWindowOpacity(1.0)
                 if not self._persistent:
                     self.deleteLater()
 
             except Exception:
                 pass
 
+            self.closed.emit()
+
+    def _on_motion_finished(self, entered: bool):
+        if not entered:
+            self._on_hide_animation_finished()
+
+    def _slide_offset(self, distance: int = SLIDE_PX) -> QPoint:
+        """Offset toward the bar: popups that open downward slide down into place, upward ones slide up."""
+        pos_args = getattr(self, "_pos_args", None)
+        direction = pos_args[1] if pos_args else "down"
+        return QPoint(0, distance if direction == "up" else -distance)
+
     def show_animated(self):
-        current_geometry = self._canvas.geometry()
-
-        start_geometry = QRect(
-            current_geometry.x(),
-            current_geometry.y(),
-            current_geometry.width(),
-            1,
-        )
-
-        end_geometry = QRect(
-            current_geometry.x(),
-            current_geometry.y(),
-            current_geometry.width(),
-            current_geometry.height(),
-        )
-
-        self._show_animation.setStartValue(start_geometry)
-        self._show_animation.setEndValue(end_geometry)
-        self._show_animation.setEasingCurve(QEasingCurve.Type.OutQuad)
-
-        self._show_animation.start()
+        """Fade in and slide into place from the bar side."""
+        self._motion.enter(self.pos(), self._slide_offset(), POPUP_ENTER_MS if self._animated else 0)
 
     def hide_animated(self):
         """Hide the popup with animation."""
         if self._is_closing:
             return
+        self._is_closing = True
+        # Clicks on the bar should work again while the popup fades out
         try:
-            if self._hide_animation.state() == QPropertyAnimation.State.Running:
-                self._hide_animation.stop()
+            QApplication.instance().removeEventFilter(self)
         except Exception:
             pass
-
-        self._is_closing = True
-
-        current_geometry = self._canvas.geometry()
-
-        end_geometry = QRect(
-            current_geometry.x(),
-            current_geometry.y(),
-            current_geometry.width(),
-            1,
-        )
-
-        self._hide_animation.setStartValue(current_geometry)
-        self._hide_animation.setEndValue(end_geometry)
-        self._hide_animation.setEasingCurve(QEasingCurve.Type.OutQuad)
-
-        self._hide_animation.start()
+        self._motion.exit(self._slide_offset(EXIT_SLIDE_PX), POPUP_EXIT_MS if self._animated else 0)
 
     def hide(self):
         """Hide the popup immediately without animation."""
-        try:
-            if self._hide_animation.state() == QPropertyAnimation.State.Running:
-                self._hide_animation.stop()
-        except Exception:
-            pass
+        self._motion.stop()
 
         self._is_closing = True
 
@@ -502,10 +480,25 @@ class PopupWidget(QWidget):
 
         try:
             super().hide()
+            self.setWindowOpacity(1.0)
             if not self._persistent:
                 self.deleteLater()
         except Exception:
             pass
+
+        self.closed.emit()
+
+    def adjustSize(self):
+        """Fit the window to its content.
+
+        Most popups put their layout on _popup_content, which QWidget.adjustSize() cannot see from
+        the window (it would measure the canvas instead), so measure the content directly.
+        """
+        if self.layout() is None and self._popup_content.layout() is not None:
+            self._popup_content.adjustSize()
+            self.resize(self._popup_content.sizeHint())
+            return
+        super().adjustSize()
 
     def closeEvent(self, event):
         """Override close event to use animation."""
@@ -532,6 +525,9 @@ class PopupWidget(QWidget):
                     pass
                 PopupWidget._open_popups.pop(parent_id, None)
 
+        self._is_closing = False
+        # Start invisible so the first frame is never drawn at full opacity
+        self.setWindowOpacity(0.0)
         super().show()
         self.show_animated()
 
@@ -556,13 +552,8 @@ class PopupWidget(QWidget):
                 BorderColor=self._border_color,
             )
 
-        # Reset closing state and stop any ongoing fade animation
+        # Reset closing state; show_animated() takes over any fade-out still running
         self._is_closing = False
-        try:
-            if self._hide_animation.state() == QPropertyAnimation.State.Running:
-                self._hide_animation.stop()
-        except Exception:
-            pass
 
         super().showEvent(event)
 
@@ -617,21 +608,17 @@ class PopupWidget(QWidget):
         super().hideEvent(event)
 
     def resizeEvent(self, event):
-        if (
-            self._show_animation.state() == QPropertyAnimation.State.Running
-            and self._hide_animation.state() == QPropertyAnimation.State.Running
-        ):
-            super().resizeEvent(event)
-            return
-
-        # reset geometry
+        # The canvas and content always fill the window; only the window itself animates
         self._canvas.setGeometry(0, 0, self.width(), self.height())
         self._popup_content.setGeometry(0, 0, self._canvas.width(), self._canvas.height())
 
         # reposition if we've already called setPosition()
-        if hasattr(self, "_pos_args"):
+        if getattr(self, "_pos_args", None):
             alignment, direction, offset_left, offset_top = self._pos_args
             self.setPosition(alignment, direction, offset_left, offset_top)
+            if self._motion.is_running():
+                # setPosition() put the window at its new resting spot; continue the animation from there
+                self._motion.retarget(self.pos())
 
         super().resizeEvent(event)
 
