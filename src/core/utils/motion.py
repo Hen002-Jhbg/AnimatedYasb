@@ -1,8 +1,9 @@
-"""Shared motion for popups and context menus.
+"""Shared motion for popups, context menus and the rest of the bar.
 
-One curve and one duration scale, so every popup and menu on the bar moves the same way.
+One curve and one duration scale, so everything on the bar moves the same way.
 WindowMotion animates the top-level window itself (opacity + position), so whatever the window
-contains moves with it and nothing is resized or re-laid out while it runs.
+contains moves with it and nothing is resized or re-laid out while it runs. ValueMotion animates
+a single number (a scroll offset, a height) on the same curve and ticker.
 """
 
 import ctypes
@@ -209,3 +210,73 @@ class WindowMotion(QObject):
         self._window.setWindowOpacity(opacity)
         if self._window.x() != x or self._window.y() != y:
             self._window.move(x, y)
+
+
+class ValueMotion(QObject):
+    """Animates one number on the shared curve and ticker, for motion that is not a whole window.
+
+    start() while running continues from the current value, so retargeting never jumps.
+    With Windows "Animation effects" off it jumps straight to the end value.
+    """
+
+    valueChanged = pyqtSignal(float)
+    finished = pyqtSignal()
+
+    def __init__(self, widget: QWidget, curve: QEasingCurve | None = None):
+        super().__init__(widget)
+        self._widget = widget
+        self._curve = curve if curve is not None else ease_out()
+        self._clock = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._tick)
+        self._from = 0.0
+        self._to = 0.0
+        self._value = 0.0
+        self._duration = 0
+        self._ticks = 0
+
+    def value(self) -> float:
+        return self._value
+
+    def is_running(self) -> bool:
+        return self._timer.isActive()
+
+    def stop(self) -> None:
+        """Stop where it is, without emitting finished."""
+        self._timer.stop()
+
+    def start(self, start: float, end: float, duration_ms: int) -> None:
+        self._timer.stop()
+        self._from = float(start)
+        self._to = float(end)
+        self._duration = max(0, int(duration_ms)) if animations_enabled() else 0
+        if self._duration == 0:
+            self._set(self._to)
+            self.finished.emit()
+            return
+        self._set(self._from)
+        self._timer.setInterval(tick_interval_ms(self._widget))
+        self._ticks = 0
+        self._clock.start()
+        self._timer.start()
+
+    def _tick(self) -> None:
+        self._ticks += 1
+        t = min(1.0, self._clock.elapsed() / self._duration)
+        self._set(self._from + (self._to - self._from) * self._curve.valueForProgress(t))
+        if t >= 1.0:
+            self._timer.stop()
+            if os.path.exists(_DEBUG_FLAG):
+                logging.info(
+                    "value motion %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
+                    self._duration,
+                    self._ticks,
+                    self._timer.interval(),
+                    self._clock.elapsed() / max(1, self._ticks),
+                )
+            self.finished.emit()
+
+    def _set(self, value: float) -> None:
+        self._value = value
+        self.valueChanged.emit(value)

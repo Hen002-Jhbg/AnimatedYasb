@@ -5,7 +5,6 @@ from functools import partial
 from typing import NamedTuple
 
 from PyQt6.QtCore import (
-    QEasingCurve,
     QEvent,
     QPoint,
     QPointF,
@@ -13,7 +12,6 @@ from PyQt6.QtCore import (
     QRectF,
     Qt,
     QThreadPool,
-    QVariantAnimation,
 )
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QPolygonF
 from PyQt6.QtWidgets import (
@@ -24,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.bar_helper import GlobalState
+from core.utils.motion import ValueMotion
 from core.utils.win32.utils import apply_qmenu_style
 from core.utils.win32.window_actions import force_foreground_focus
 from core.widgets.services.wallpapers.images import FolderScanner, ImageLoader
@@ -32,8 +31,8 @@ from core.widgets.services.wallpapers.manager import WallpaperManager
 FADE_IN_DURATION = 80
 FADE_OUT_DURATION = 120
 
-CARD_ANIMATION_DURATION = 320
-CARD_ANIMATION_EASING = QEasingCurve.Type.OutCubic
+# One arrow-key step of the carousel; on the shared strong ease-out curve (ValueMotion's default)
+CARD_ANIMATION_DURATION = 200
 
 # Windows hit tests a translucent window per pixel, so a fully transparent gap
 # is clicked through. One step of alpha catches the click instead.
@@ -199,9 +198,7 @@ class CardsView(QWidget):
         self.hovered: int | None = None
         self.hit_areas: list[tuple[int, QPolygonF]] = []
 
-        self.animation = QVariantAnimation(self)
-        self.animation.setDuration(CARD_ANIMATION_DURATION)
-        self.animation.setEasingCurve(CARD_ANIMATION_EASING)
+        self.animation = ValueMotion(self)
         self.animation.valueChanged.connect(self._on_animation_value)
         self.animation.finished.connect(self._on_animation_finished)
 
@@ -405,9 +402,8 @@ class CardsView(QWidget):
             self.update()
             return
 
-        self.animation.setStartValue(self.offset)
-        self.animation.setEndValue(target)
-        self.animation.start()
+        # Starts from the current offset, so fast repeated arrow presses retarget instead of jumping
+        self.animation.start(self.offset, target, CARD_ANIMATION_DURATION)
 
     def move_by(self, delta: int):
         count = self.count
