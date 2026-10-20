@@ -6,6 +6,8 @@ contains moves with it and nothing is resized or re-laid out while it runs.
 """
 
 import ctypes
+import logging
+import os
 
 from PyQt6.QtCore import QElapsedTimer, QEasingCurve, QEvent, QObject, QPoint, QPointF, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import QWidget
@@ -27,6 +29,22 @@ _SPI_GETCLIENTAREAANIMATION = 0x1042
 
 # Longest wait for a newly shown window's first paint before the animation clock starts anyway
 _FIRST_PAINT_WAIT_MS = 50
+
+# Create this file to log tick timing of every animation to yasb.log
+_DEBUG_FLAG = os.path.join(os.path.expanduser("~"), ".config", "yasb", "motion-debug")
+
+
+def tick_interval_ms(widget: QWidget) -> int:
+    """Timer interval that lands at least one update in every frame of the widget's screen.
+
+    Qt's animation timer is fixed at 16 ms (60 Hz); on a 165 Hz screen that holds each step for
+    about three frames. Ticking at 2/3 of the frame time keeps one update per frame.
+    """
+    screen = widget.screen()
+    hz = screen.refreshRate() if screen else 0.0
+    if hz <= 0:
+        return DEFAULT_TICK_MS
+    return max(1, min(DEFAULT_TICK_MS, int(1000.0 / hz / 1.5)))
 
 
 def ease_out() -> QEasingCurve:
@@ -70,6 +88,7 @@ class WindowMotion(QObject):
         self._timer.timeout.connect(self._tick)
         self._entering = True
         self._duration = 0
+        self._ticks = 0
         self._progress = 1.0
         self._from_opacity = 1.0
         self._to_opacity = 1.0
@@ -142,6 +161,8 @@ class WindowMotion(QObject):
             self.finished.emit(entering)
             return
         self._apply(0.0)
+        self._timer.setInterval(tick_interval_ms(self._window))
+        self._ticks = 0
         if self._awaiting_paint:
             # Newly shown window: _tick() starts the clock once its first frame is painted
             self._clock.invalidate()
@@ -156,10 +177,20 @@ class WindowMotion(QObject):
                 return
             self._clock.start()
             return
+        self._ticks += 1
         t = min(1.0, self._clock.elapsed() / self._duration)
         self._apply(t)
         if t >= 1.0:
             self._timer.stop()
+            if os.path.exists(_DEBUG_FLAG):
+                logging.info(
+                    "motion %s %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
+                    "enter" if self._entering else "exit",
+                    self._duration,
+                    self._ticks,
+                    self._timer.interval(),
+                    self._clock.elapsed() / max(1, self._ticks),
+                )
             self.finished.emit(self._entering)
 
     def _apply(self, t: float) -> None:
