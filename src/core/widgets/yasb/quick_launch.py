@@ -493,7 +493,7 @@ class QuickLaunchWidget(BaseWidget):
         self._popup.hide_animated()
 
     def _on_popup_closed(self):
-        """Called when the fade-out animation finishes."""
+        """Called when the popup has finished closing."""
         if not (self._popup and self._popup._is_closing):
             return
         if not self._position_locked:
@@ -587,12 +587,13 @@ class QuickLaunchWidget(BaseWidget):
             round_corners_type=cfg.round_corners_type,
             border_color=cfg.border_color,
             dark_mode=cfg.dark_mode,
+            # Opened from a keyboard shortcut many times a day: appear and disappear instantly
+            animated=False,
         )
         popup.setProperty("class", "quick-launch-popup")
         popup._popup_content.setProperty("class", "container")
         popup.setFixedSize(cfg.width, cfg.height)
-        popup._fade_animation.setDuration(40)
-        popup._fade_animation.finished.connect(self._on_popup_closed)
+        popup.closed.connect(self._on_popup_closed)
 
         main_layout = QVBoxLayout(popup._popup_content)
         main_layout.setContentsMargins(0, 0, 0, 0)
