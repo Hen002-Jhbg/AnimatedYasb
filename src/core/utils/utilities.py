@@ -19,6 +19,7 @@ from PyQt6.QtGui import (
     QFontMetrics,
     QGuiApplication,
     QHideEvent,
+    QMouseEvent,
     QPainter,
     QPaintEvent,
     QResizeEvent,
@@ -606,12 +607,35 @@ class PopupWidget(QWidget):
                 self.hide_animated()
                 return True
 
-            # A click on anything else (another bar widget) is meant for that thing. Hide at once: Qt then
-            # replays this press to whatever is under the cursor. A fading popup would keep the mouse grab
-            # until the fade ends and eat the click, so switching popups used to take two clicks.
+            # A click on anything else (another bar widget) is meant for that thing. Hide at once and hand the
+            # press on: a fading popup would keep the mouse grab and eat the click, and Qt's own replay needs an
+            # active window, which the bar never is. Without a press the release reaches nobody, so switching
+            # popups used to take two clicks. Qt must not replay it a second time.
+            self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay)
             self.hide()
+            self._replay_press(event)
             return True
         return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _replay_press(event: QMouseEvent) -> None:
+        """Deliver a press that closed this popup to whatever is under the cursor, as Qt itself would."""
+        global_pos = event.globalPosition().toPoint()
+        target = QApplication.widgetAt(global_pos)
+        window = target.window().windowHandle() if target is not None else None
+        if window is None:
+            return
+        local = QPointF(window.mapFromGlobal(global_pos))
+        press = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            local,
+            local,
+            event.globalPosition(),
+            event.button(),
+            event.buttons(),
+            event.modifiers(),
+        )
+        QApplication.sendEvent(window, press)
 
     def _is_on_trigger(self, global_pos: QPoint) -> bool:
         """True when global_pos is on the bar widget this popup belongs to."""
