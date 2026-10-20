@@ -4,11 +4,9 @@ from functools import lru_cache
 from typing import Any, cast, override
 
 from PyQt6.QtCore import (
-    QEasingCurve,
     QEvent,
     QObject,
     QPoint,
-    QPropertyAnimation,
     QRect,
     QSize,
     Qt,
@@ -40,7 +38,15 @@ from PyQt6.QtWidgets import (
 from winrt.windows.data.xml.dom import XmlDocument
 from winrt.windows.ui.notifications import ToastNotification, ToastNotificationManager
 
-from core.utils.motion import EXIT_SLIDE_PX, POPUP_ENTER_MS, POPUP_EXIT_MS, SLIDE_PX, WindowMotion
+from core.utils.motion import (
+    EXIT_SLIDE_PX,
+    MENU_ENTER_MS,
+    MENU_EXIT_MS,
+    POPUP_ENTER_MS,
+    POPUP_EXIT_MS,
+    SLIDE_PX,
+    WindowMotion,
+)
 from core.utils.qobject import is_valid_qobject
 from core.utils.system import is_windows_10
 from core.utils.win32.backdrop import enable_blur
@@ -132,14 +138,26 @@ def get_app_identifier():
 
 
 class AnimatedContextMenu(QMenu):
+    """QMenu that fades in with a short slide, and fades out when it is closed by an outside click.
+
+    It opens through popup() so aboutToShow fires; apply_qmenu_style() applies the rounded corners
+    and blur on that signal. The window keeps its size the whole time.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self._animation = None
         self._is_closing = False
-        self._final_geometry = None
+        self._motion = WindowMotion(self)
+        self._motion.finished.connect(self._on_motion_finished)
 
-    def show_animated(self, click_position, duration=300):
+    def _slide_offset(self, distance: int = SLIDE_PX) -> QPoint:
+        """Menus in the upper half of the screen open downward (slide down), lower half open upward."""
+        screen = QGuiApplication.screenAt(self.geometry().center()) or QGuiApplication.primaryScreen()
+        upward = self.geometry().center().y() > screen.availableGeometry().center().y()
+        return QPoint(0, distance if upward else -distance)
+
+    def show_animated(self, click_position, duration=MENU_ENTER_MS):
         menu_size = self.sizeHint()
         screen = QGuiApplication.screenAt(click_position)
 
@@ -167,71 +185,42 @@ class AnimatedContextMenu(QMenu):
 
         position = QPoint(x, y)
 
-        self.adjustSize()
+        self._is_closing = False
+        # Start invisible so the first frame is never drawn at full opacity
+        self.setWindowOpacity(0.0)
 
-        final_geometry = QRect(
-            position.x(),
-            position.y(),
-            self.sizeHint().width(),
-            self.sizeHint().height(),
-        )
-
-        self._final_geometry = final_geometry
-
-        start_y = final_geometry.top()
-        start_x = final_geometry.left()
-
-        start_geometry = QRect(
-            start_x,
-            start_y,
-            final_geometry.width(),
-            1,
-        )
-
-        self.setGeometry(start_geometry)
-        self.show()
+        # Qt's own menu effect (Windows "Fade or slide menus into view") would run on top of ours
+        native_effect = QApplication.isEffectEnabled(Qt.UIEffect.UI_AnimateMenu)
+        QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateMenu, False)
+        try:
+            self.popup(position)
+        finally:
+            QApplication.setEffectEnabled(Qt.UIEffect.UI_AnimateMenu, native_effect)
         self.activateWindow()
 
-        self._animation = QPropertyAnimation(self, b"geometry", self)
-        self._animation.setDuration(duration)
-        self._animation.setStartValue(start_geometry)
-        self._animation.setEndValue(final_geometry)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutQuad)
-        self._animation.start()
+        self._motion.enter(self.pos(), self._slide_offset(), duration)
 
-    def hide_animated(self, duration=300):
-        current_geometry = self.geometry()
+    def hide_animated(self, duration=MENU_EXIT_MS):
+        if self._is_closing:
+            return
+        self._is_closing = True
+        self._motion.exit(self._slide_offset(EXIT_SLIDE_PX), duration)
 
-        end_x: int = current_geometry.left()
-        end_y: int = current_geometry.top()
-
-        end_geometry = QRect(
-            end_x,
-            end_y,
-            current_geometry.width(),
-            1,
-        )
-
-        self._animation = QPropertyAnimation(self, b"geometry", self)
-        self._animation.setDuration(duration)
-        self._animation.setStartValue(current_geometry)
-        self._animation.setEndValue(end_geometry)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutQuad)
-
-        self._animation.finished.connect(self._finish_hide)
-        self._animation.start()
+    def _on_motion_finished(self, entered: bool):
+        if not entered:
+            self._finish_hide()
 
     def _finish_hide(self):
         self.hide()
         self.deleteLater()
 
+    def hideEvent(self, event):
+        # Clicking an action or pressing Esc hides the menu directly; drop any fade still running
+        self._motion.stop()
+        super().hideEvent(event)
+
     def closeEvent(self, event):
         event.ignore()
-
-        if self._is_closing:
-            return
-
-        self._is_closing = True
         self.hide_animated()
 
 
