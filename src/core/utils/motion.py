@@ -5,14 +5,29 @@ WindowMotion animates the top-level window itself (opacity + position), so whate
 contains moves with it and nothing is resized or re-laid out while it runs. ValueMotion animates
 a single number (a scroll offset, a height) on the same curve and ticker. SpringMotion moves a
 number on a critically damped spring for motion that is retargeted often, like a carousel.
+SnapshotMotion plays a popup's entrance and exit on a copy of it drawn at sub-pixel position and
+scale, because a real window can only sit on whole pixels.
 """
 
 import ctypes
 import logging
 import math
 import os
+from collections.abc import Callable
 
-from PyQt6.QtCore import QElapsedTimer, QEasingCurve, QEvent, QObject, QPoint, QPointF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import (
+    QElapsedTimer,
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt6.QtGui import QPainter
 from PyQt6.QtWidgets import QWidget
 
 POPUP_ENTER_MS = 200
@@ -34,6 +49,12 @@ TOOLTIP_SLIDE_PX = 4
 
 # A tooltip shown this soon after another (pointer moving along a row of icons) appears at once
 TOOLTIP_WARM_MS = 300
+
+# Snapshot popups also grow slightly from the side facing the bar, and shrink a hair on the way out
+ENTER_SCALE = 0.97
+EXIT_SCALE = 0.99
+# Room around the snapshot so the slide never clips it, in pixels
+SNAPSHOT_MARGIN_PX = 12
 
 # Qt's own animation timer ticks every 16 ms
 DEFAULT_TICK_MS = 16
@@ -376,3 +397,230 @@ class SpringMotion(QObject):
     def _set(self, value: float) -> None:
         self._value = value
         self.valueChanged.emit(value)
+
+
+class SnapshotGhost(QWidget):
+    """A click-through copy of a window, painted at a sub-pixel offset, scale and opacity.
+
+    Its state is (opacity, scale, dx, dy). The copy is taken when the ghost is created or refreshed;
+    it only has to stand in for the real window for the ~200 ms an entrance or exit takes.
+    """
+
+    finished = pyqtSignal()
+
+    def __init__(self, window: QWidget, origin: QPointF):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.NoDropShadowWindowHint
+            | Qt.WindowType.WindowTransparentForInput
+            | Qt.WindowType.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._curve = ease_out()
+        self._clock = QElapsedTimer()
+        self._wait = QElapsedTimer()
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._tick)
+        self._painted = False
+        self._duration = 0
+        self._ticks = 0
+        self._state = (0.0, 1.0, 0.0, 0.0)
+        self._from = self._state
+        self._to = self._state
+        self._origin = QPointF(origin)
+        self.refresh(window)
+
+    def refresh(self, window: QWidget) -> None:
+        """Copy window again and sit over its current place, keeping the current state."""
+        self._pixmap = window.grab()
+        rest = QRect(window.mapToGlobal(QPoint(0, 0)), window.size())
+        margin = SNAPSHOT_MARGIN_PX
+        self.setGeometry(rest.adjusted(-margin, -margin, margin, margin))
+        self.update()
+
+    def set_origin(self, origin: QPointF) -> None:
+        self._origin = QPointF(origin)
+
+    def state(self) -> tuple[float, float, float, float]:
+        return self._state
+
+    def is_running(self) -> bool:
+        return self._timer.isActive()
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    def jump(self, state: tuple[float, float, float, float]) -> None:
+        self._timer.stop()
+        self._state = state
+        self.update()
+
+    def animate(self, to_state: tuple[float, float, float, float], duration_ms: int) -> None:
+        """Move from the current state to to_state on the shared curve; emits finished at the end."""
+        self._timer.stop()
+        self._from = self._state
+        self._to = to_state
+        self._duration = max(0, int(duration_ms))
+        if self._duration == 0:
+            self.jump(to_state)
+            self.finished.emit()
+            return
+        self._timer.setInterval(tick_interval_ms(self))
+        self._ticks = 0
+        self._clock.invalidate()
+        self._wait.start()
+        self._timer.start()
+
+    def _tick(self) -> None:
+        if not self._clock.isValid():
+            # A new window needs its first paint before the clock starts, or the start is skipped
+            if not self._painted and self._wait.elapsed() < _FIRST_PAINT_WAIT_MS:
+                return
+            self._clock.start()
+            return
+        self._ticks += 1
+        t = min(1.0, self._clock.elapsed() / self._duration)
+        eased = self._curve.valueForProgress(t)
+        self._state = tuple(a + (b - a) * eased for a, b in zip(self._from, self._to))
+        self.update()
+        if t >= 1.0:
+            self._timer.stop()
+            if os.path.exists(_DEBUG_FLAG):
+                logging.info(
+                    "snapshot motion %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
+                    self._duration,
+                    self._ticks,
+                    self._timer.interval(),
+                    self._clock.elapsed() / max(1, self._ticks),
+                )
+            self.finished.emit()
+
+    def paintEvent(self, event) -> None:
+        self._painted = True
+        opacity, scale, dx, dy = self._state
+        if opacity <= 0.0 or self._pixmap.isNull():
+            return
+        margin = float(SNAPSHOT_MARGIN_PX)
+        pivot_x = margin + self._origin.x()
+        pivot_y = margin + self._origin.y()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setOpacity(opacity)
+        painter.translate(pivot_x + dx, pivot_y + dy)
+        painter.scale(scale, scale)
+        painter.translate(-pivot_x, -pivot_y)
+        painter.drawPixmap(QPointF(margin, margin), self._pixmap)
+        painter.end()
+
+
+class SnapshotMotion(QObject):
+    """WindowMotion's interface, but the window never moves: a SnapshotGhost plays the motion.
+
+    A real window sits on whole pixels, so moving it turns an 8 px slide into eight separate 1 px
+    jumps, the last ones several frames apart. Here the real window stays at rest and invisible
+    (opacity 0, still taking input) while the ghost draws a copy of it sliding at sub-pixel precision
+    and growing from the side facing the bar. When the entrance ends, the real window takes over at
+    exactly the same pixels. On exit the copy fades while the real window waits, invisible.
+    """
+
+    # True when an enter animation completed, False when an exit animation completed
+    finished = pyqtSignal(bool)
+
+    def __init__(self, window: QWidget, origin: Callable[[], QPointF]):
+        super().__init__(window)
+        self._window = window
+        self._origin = origin
+        self._ghost: SnapshotGhost | None = None
+        self._entering = True
+
+    def is_running(self) -> bool:
+        return self._ghost is not None and self._ghost.is_running()
+
+    def is_exiting(self) -> bool:
+        return self.is_running() and not self._entering
+
+    def enter(self, rest_pos: QPoint, offset: QPoint, duration_ms: int) -> None:
+        """Fade in, slide from rest_pos + offset and grow to full size, without moving the window."""
+        if self._window.pos() != rest_pos:
+            self._window.move(rest_pos)
+        if duration_ms <= 0:
+            self._drop_ghost()
+            self._window.setWindowOpacity(1.0)
+            self.finished.emit(True)
+            return
+        scale = ENTER_SCALE
+        if not animations_enabled():
+            offset, scale = QPoint(0, 0), 1.0
+        self._entering = True
+        ghost = self._ghost
+        if ghost is None:
+            ghost = self._new_ghost()
+            ghost.jump((0.0, scale, float(offset.x()), float(offset.y())))
+        else:
+            # Reversing an exit: keep the frame it is at, copy the window again
+            ghost.set_origin(self._origin())
+            ghost.refresh(self._window)
+        self._window.setWindowOpacity(0.0)
+        ghost.show()
+        ghost.animate((1.0, 1.0, 0.0, 0.0), duration_ms)
+
+    def exit(self, offset: QPoint, duration_ms: int) -> None:
+        """Fade out, drift by offset and shrink a hair; the owner hides the real window afterwards."""
+        if duration_ms <= 0 or not self._window.isVisible():
+            self._drop_ghost()
+            self.finished.emit(False)
+            return
+        scale = EXIT_SCALE
+        if not animations_enabled():
+            offset, scale = QPoint(0, 0), 1.0
+        self._entering = False
+        ghost = self._ghost
+        if ghost is None:
+            ghost = self._new_ghost()
+            ghost.jump((self._window.windowOpacity(), 1.0, 0.0, 0.0))
+        else:
+            ghost.refresh(self._window)
+        # The real window stays shown so it keeps the mouse grab (the closing click must not reach
+        # the widget that opened it), but only the copy is visible
+        self._window.setWindowOpacity(0.0)
+        ghost.show()
+        ghost.animate((0.0, scale, float(offset.x()), float(offset.y())), duration_ms)
+
+    def retarget(self, rest_pos: QPoint) -> None:
+        """The window was resized or re-anchored mid-animation: copy it again where it is now."""
+        if self._ghost is not None:
+            self._ghost.set_origin(self._origin())
+            self._ghost.refresh(self._window)
+
+    def stop(self) -> None:
+        """Remove the copy at once, without emitting finished."""
+        self._drop_ghost()
+
+    def _new_ghost(self) -> SnapshotGhost:
+        ghost = SnapshotGhost(self._window, self._origin())
+        ghost.finished.connect(self._on_ghost_finished)
+        self._window.destroyed.connect(ghost.deleteLater)
+        self._ghost = ghost
+        return ghost
+
+    def _drop_ghost(self) -> None:
+        ghost, self._ghost = self._ghost, None
+        if ghost is not None:
+            ghost.stop()
+            ghost.finished.disconnect(self._on_ghost_finished)
+            ghost.hide()
+            ghost.deleteLater()
+
+    def _on_ghost_finished(self) -> None:
+        entering = self._entering
+        if entering:
+            # Hand over to the real window at the exact same pixels, then remove the copy
+            self._window.setWindowOpacity(1.0)
+        self._drop_ghost()
+        self.finished.emit(entering)

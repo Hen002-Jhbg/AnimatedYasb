@@ -1,10 +1,18 @@
 import ctypes
 
-from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QPointF, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication, QFrame, QVBoxLayout, QWidget
 
-from core.utils.motion import EXIT_SLIDE_PX, POPUP_ENTER_MS, POPUP_EXIT_MS, SLIDE_PX, WindowMotion
+from core.utils.motion import (
+    EXIT_SLIDE_PX,
+    POPUP_ENTER_MS,
+    POPUP_EXIT_MS,
+    SLIDE_PX,
+    SnapshotGhost,
+    SnapshotMotion,
+    WindowMotion,
+)
 from core.utils.win32.backdrop import enable_blur
 from core.utils.win32.bindings import user32
 from core.widgets.services.systray.systray_widget import DropWidget, IconWidget
@@ -60,8 +68,8 @@ class SystrayPopup(QWidget):
         outer.addWidget(self._grid_widget)
         self.setLayout(outer)
 
-        # Same window fade + slide as every other bar popup
-        self._motion = WindowMotion(self)
+        # Same motion as every other bar popup: a sub-pixel copy plays it unless the popup is blurred
+        self._motion = WindowMotion(self) if self._blur else SnapshotMotion(self, self._scale_origin)
         self._motion.finished.connect(self._on_motion_finished)
 
         # Watch timer for native mouse-poll (context-menu interaction)
@@ -161,6 +169,17 @@ class SystrayPopup(QWidget):
     def _popup_rect(self) -> QRect:
         return QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
 
+    def _scale_origin(self) -> QPointF:
+        """Where the popup grows from: its edge facing the bar, under the middle of the toggle button."""
+        pos_args = getattr(self, "_pos_args", None)
+        direction = pos_args[1] if pos_args else self._popup_config.direction
+        x = self.width() / 2.0
+        btn = self._toggle_btn
+        if btn is not None and btn.isVisible():
+            centre = btn.mapToGlobal(btn.rect().center()).x() - self.mapToGlobal(QPoint(0, 0)).x()
+            x = float(min(max(centre, 0), self.width()))
+        return QPointF(x, float(self.height()) if direction == "up" else 0.0)
+
     def _slide_offset(self, distance: int = SLIDE_PX) -> QPoint:
         """Offset toward the bar: a popup below the bar slides down into place, one above it slides up."""
         pos_args = getattr(self, "_pos_args", None)
@@ -232,6 +251,10 @@ class SystrayPopup(QWidget):
     def changeEvent(self, event):
         super().changeEvent(event)
         if event.type() != QEvent.Type.ActivationChange or self._is_closing:
+            return
+        if isinstance(QApplication.activeWindow(), SnapshotGhost):
+            # Our own sub-pixel copy never takes focus on Windows; if a platform activates it anyway,
+            # that is not the user leaving the popup
             return
         if self.isActiveWindow():
             self._watch_timer.stop()

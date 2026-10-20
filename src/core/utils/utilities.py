@@ -7,6 +7,7 @@ from PyQt6.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QPointF,
     QRect,
     QSize,
     Qt,
@@ -45,6 +46,8 @@ from core.utils.motion import (
     POPUP_ENTER_MS,
     POPUP_EXIT_MS,
     SLIDE_PX,
+    SnapshotGhost,
+    SnapshotMotion,
     WindowMotion,
 )
 from core.utils.qobject import is_valid_qobject
@@ -294,9 +297,11 @@ class PopupWidget(QWidget):
         self._canvas = QWidget(self)
         self._popup_content = QFrame(self._canvas)
 
-        # The whole window fades and slides; the canvas and content always fill it
+        # A copy of the window plays the fade, slide and slight growth at sub-pixel precision while the
+        # window itself stays put (a window can only move by whole pixels). Blurred popups keep moving
+        # the real window, because a snapshot cannot carry DWM's live blur.
         self._animated = animated
-        self._motion = WindowMotion(self)
+        self._motion = WindowMotion(self) if blur else SnapshotMotion(self, self._scale_origin)
         self._motion.finished.connect(self._on_motion_finished)
 
         self._is_closing = False
@@ -393,6 +398,9 @@ class PopupWidget(QWidget):
         # Popup-type windows do, so we replicate that behaviour here:
         # close when not pinned, stay open when pinned.
         if event.type() == QEvent.Type.WindowDeactivate and self._pinnable:
+            if isinstance(QApplication.activeWindow(), SnapshotGhost):
+                # Our own sub-pixel copy is not the user leaving the popup
+                return True
             if not self._pinned:
                 self.hide_animated()
             return True
@@ -436,6 +444,17 @@ class PopupWidget(QWidget):
         pos_args = getattr(self, "_pos_args", None)
         direction = pos_args[1] if pos_args else "down"
         return QPoint(0, distance if direction == "up" else -distance)
+
+    def _scale_origin(self) -> QPointF:
+        """Where the popup grows from: its edge facing the bar, under the middle of its trigger."""
+        pos_args = getattr(self, "_pos_args", None)
+        up = bool(pos_args) and pos_args[1] == "up"
+        x = self.width() / 2.0
+        trigger = self._parent
+        if trigger is not None and is_valid_qobject(trigger) and trigger.isVisible():
+            centre = trigger.mapToGlobal(trigger.rect().center()).x() - self.mapToGlobal(QPoint(0, 0)).x()
+            x = float(min(max(centre, 0), self.width()))
+        return QPointF(x, float(self.height()) if up else 0.0)
 
     def show_animated(self):
         """Fade in and slide into place from the bar side."""
