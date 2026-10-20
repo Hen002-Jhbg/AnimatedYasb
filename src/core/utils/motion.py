@@ -21,6 +21,9 @@ MENU_ENTER_MS = 150
 MENU_EXIT_MS = 125
 TOOLTIP_ENTER_MS = 125
 TOOLTIP_EXIT_MS = 100
+# A section inside a popup opening or closing (the volume menu's app list)
+EXPAND_MS = 200
+COLLAPSE_MS = 150
 
 # How far a popup or menu travels while it fades in, in pixels
 SLIDE_PX = 8

@@ -2,10 +2,11 @@ import logging
 import re
 
 from PIL import Image
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt
+from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QImage, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
+from core.utils.motion import COLLAPSE_MS, EXPAND_MS, ValueMotion
 from core.utils.qobject import is_valid_qobject
 from core.utils.tooltip import CustomToolTip, set_tooltip
 from core.utils.utilities import (
@@ -170,19 +171,21 @@ class VolumeWidget(BaseWidget):
         # Toggle the expanded state
         self.app_volumes_expanded = not self.app_volumes_expanded
 
+        # Continue from the height the list has right now, so toggling mid-way reverses instead of jumping
+        motion = self.app_volume_motion
         if self.app_volumes_expanded:
             # Show container first
             self.app_volumes_container.show()
             content_height = self.app_volumes_container.sizeHint().height()
             target_height = content_height
-            current_height = 0
+            current_height = motion.value() if motion.is_running() else 0
             self.app_toggle_btn.setText(self.config.audio_menu.app_icons.toggle_up)
             self.app_toggle_btn.setProperty("class", "toggle-apps expanded")
             if self.config.tooltip:
                 set_tooltip(self.app_toggle_btn, "Collapse application volumes")
         else:
             target_height = 0
-            current_height = self.app_volumes_container.height()
+            current_height = motion.value() if motion.is_running() else self.app_volumes_container.height()
             self.app_toggle_btn.setText(self.config.audio_menu.app_icons.toggle_down)
             self.app_toggle_btn.setProperty("class", "toggle-apps")
             if self.config.tooltip:
@@ -190,31 +193,19 @@ class VolumeWidget(BaseWidget):
 
         refresh_widget_style(self.app_toggle_btn)
 
-        # Stop any existing animation
-        if (
-            hasattr(self, "app_volume_animation")
-            and self.app_volume_animation.state() == QPropertyAnimation.State.Running
-        ):
-            self.app_volume_animation.stop()
+        # Shared strong ease-out at the screen refresh rate; opening takes a little longer than closing
+        motion.start(current_height, target_height, EXPAND_MS if self.app_volumes_expanded else COLLAPSE_MS)
 
-        # Set the starting height immediately before animation
-        self.app_volumes_container.setMaximumHeight(current_height)
+    def _on_app_volumes_height(self, value: float):
+        """Grow or shrink the app list and fit the popup around it, one frame at a time."""
+        self.app_volumes_container.setMaximumHeight(round(value))
+        self._resize_dialog()
 
-        # Create animation
-        self.app_volume_animation = QPropertyAnimation(self.app_volumes_container, b"maximumHeight")
-        self.app_volume_animation.setDuration(200)
-        self.app_volume_animation.setStartValue(current_height)
-        self.app_volume_animation.setEndValue(target_height)
-        self.app_volume_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-
-        # Update dialog size during animation
-        self.app_volume_animation.valueChanged.connect(self._resize_dialog)
-
-        # Hide container after animation completes if collapsing
+    def _on_app_volumes_motion_finished(self):
         if not self.app_volumes_expanded:
-            self.app_volume_animation.finished.connect(lambda: self.app_volumes_container.hide())
-
-        self.app_volume_animation.start()
+            self.app_volumes_container.hide()
+            # Refit once more: at height 0 the list still took its layout spacing in the last frame
+            self._resize_dialog()
 
     def _resize_dialog(self):
         """Resize the dialog to fit its content during animation"""
@@ -504,6 +495,11 @@ class VolumeWidget(BaseWidget):
 
             # Store expanded state
             self.app_volumes_expanded = False
+
+            # Height motion for the list; lives and dies with this container (a new one per menu)
+            self.app_volume_motion = ValueMotion(self.app_volumes_container)
+            self.app_volume_motion.valueChanged.connect(self._on_app_volumes_height)
+            self.app_volume_motion.finished.connect(self._on_app_volumes_motion_finished)
         self.dialog._popup_content.setLayout(layout)
 
         # Position And Size the dialog
