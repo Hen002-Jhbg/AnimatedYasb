@@ -16,11 +16,18 @@ POPUP_ENTER_MS = 200
 POPUP_EXIT_MS = 150
 MENU_ENTER_MS = 150
 MENU_EXIT_MS = 125
+TOOLTIP_ENTER_MS = 125
+TOOLTIP_EXIT_MS = 100
 
 # How far a popup or menu travels while it fades in, in pixels
 SLIDE_PX = 8
 # Exits move half as far: they still show direction but release attention quietly
 EXIT_SLIDE_PX = 4
+# Tooltips are small, so they travel less
+TOOLTIP_SLIDE_PX = 4
+
+# A tooltip shown this soon after another (pointer moving along a row of icons) appears at once
+TOOLTIP_WARM_MS = 300
 
 # Qt's own animation timer ticks every 16 ms
 DEFAULT_TICK_MS = 16

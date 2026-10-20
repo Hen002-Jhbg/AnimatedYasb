@@ -1,17 +1,16 @@
 from PyQt6.QtCore import (
-    QEasingCurve,
+    QElapsedTimer,
     QEvent,
     QObject,
     QPoint,
-    QPropertyAnimation,
     Qt,
     QTimer,
-    pyqtProperty,
 )
 from PyQt6.QtGui import QCursor, QGuiApplication
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from core.bar_helper import GlobalState
+from core.utils.motion import TOOLTIP_ENTER_MS, TOOLTIP_EXIT_MS, TOOLTIP_SLIDE_PX, TOOLTIP_WARM_MS, WindowMotion
 from core.utils.win32.backdrop import enable_blur
 
 
@@ -21,14 +20,13 @@ class CustomToolTip(QFrame):
     _active_tooltip = None  # Class-level reference to the currently visible tooltip
     _tooltip_pool = []  # Pool of reusable tooltip instances
     _pool_size_limit = 5  # Maximum number of tooltips to keep in pool
+    _last_hidden = QElapsedTimer()  # When the last tooltip finished hiding (see is_warm)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.ToolTip | Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet("background: transparent;")
-        self._opacity = 0.0
-        self._slide_offset = 0
         self._base_pos = None
         self._is_destroyed = False
         self._position = None  # 'top', 'bottom', or None for auto
@@ -43,70 +41,26 @@ class CustomToolTip(QFrame):
         self.layout.addWidget(self.label)
         self.apply_stylesheet()
 
-        self.fade_in_animation = None
-        self.fade_out_animation = None
-        self.slide_in_animation = None
-        self.slide_out_animation = None
+        # Same window fade + slide as the bar popups, at tooltip size and speed
+        self._motion = WindowMotion(self)
+        self._motion.finished.connect(self._on_motion_finished)
 
         self.hide_timer = QTimer(self)
         self.hide_timer.setSingleShot(True)
         self.hide_timer.timeout.connect(self.start_fade_out)
 
-        self._fade_out_done = False
-        self._slide_out_done = False
-
-    def _ensure_animations_created(self):
-        """Lazy initialization of animation objects to reduce memory usage."""
-        if self.fade_in_animation is None:
-            # Fade animation
-            self.fade_in_animation = QPropertyAnimation(self, b"opacity")
-            self.fade_in_animation.setDuration(200)
-            self.fade_in_animation.setStartValue(0.0)
-            self.fade_in_animation.setEndValue(1.0)
-            self.fade_in_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-            self.fade_out_animation = QPropertyAnimation(self, b"opacity")
-            self.fade_out_animation.setDuration(200)
-            self.fade_out_animation.setStartValue(1.0)
-            self.fade_out_animation.setEndValue(0.0)
-            self.fade_out_animation.setEasingCurve(QEasingCurve.Type.InCubic)
-            self.fade_out_animation.finished.connect(self._on_fade_out_anim_finished)
-
-            # Slide animation
-            self.slide_in_animation = QPropertyAnimation(self, b"slide_offset")
-            self.slide_in_animation.setDuration(200)
-            self.slide_in_animation.setStartValue(10)
-            self.slide_in_animation.setEndValue(0)
-            self.slide_in_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-            self.slide_out_animation = QPropertyAnimation(self, b"slide_offset")
-            self.slide_out_animation.setDuration(200)
-            self.slide_out_animation.setStartValue(0)
-            self.slide_out_animation.setEndValue(10)
-            self.slide_out_animation.setEasingCurve(QEasingCurve.Type.InCubic)
-            self.slide_out_animation.finished.connect(self._on_slide_out_anim_finished)
+    @classmethod
+    def is_warm(cls) -> bool:
+        """True while a tooltip is showing, or one hid moments ago: the pointer is moving along a row,
+        so the next tooltip should appear at once instead of waiting and animating again."""
+        active = cls._active_tooltip
+        if active is not None and active.isVisible():
+            return True
+        return cls._last_hidden.isValid() and cls._last_hidden.elapsed() < TOOLTIP_WARM_MS
 
     def cleanup_animations(self):
-        """Clean up animation objects to free memory."""
-        if self.fade_in_animation is not None:
-            self.fade_in_animation.stop()
-            self.fade_in_animation.deleteLater()
-            self.fade_in_animation = None
-
-        if self.fade_out_animation is not None:
-            self.fade_out_animation.stop()
-            self.fade_out_animation.deleteLater()
-            self.fade_out_animation = None
-
-        if self.slide_in_animation is not None:
-            self.slide_in_animation.stop()
-            self.slide_in_animation.deleteLater()
-            self.slide_in_animation = None
-
-        if self.slide_out_animation is not None:
-            self.slide_out_animation.stop()
-            self.slide_out_animation.deleteLater()
-            self.slide_out_animation = None
+        """Stop any running fade before the tooltip is pooled or deleted."""
+        self._motion.stop()
 
     @classmethod
     def get_or_create_tooltip(cls):
@@ -136,32 +90,14 @@ class CustomToolTip(QFrame):
         """Apply the tooltip stylesheet from GlobalState."""
         self.setStyleSheet(GlobalState.stylesheet())
 
-    def get_opacity(self):
-        return self._opacity
-
-    def set_opacity(self, opacity):
-        self._opacity = opacity
-        self.setWindowOpacity(opacity)
-
-    opacity = pyqtProperty(float, get_opacity, set_opacity)
-
-    def get_slide_offset(self):
-        return self._slide_offset
-
-    def set_slide_offset(self, offset):
-        self._slide_offset = offset
-        if self._base_pos:
-            self.move(self._base_pos.x(), self._base_pos.y() + int(offset))
-
-    slide_offset = pyqtProperty(float, get_slide_offset, set_slide_offset)
-
     def update_content(self, text):
         """Update tooltip content without hiding it."""
         if self.label.text() != text:
             self.label.setText(text)
             self.adjustSize()
-            if self.isVisible() and self._base_pos:
-                self.move(self._base_pos.x(), self._base_pos.y() + int(self._slide_offset))
+            # While fading in or out, the motion owns the position and lands on _base_pos itself
+            if self.isVisible() and self._base_pos and not self._motion.is_running():
+                self.move(self._base_pos)
 
     def _calculate_position(self, widget_geometry, top_level_geometry=None):
         """Calculate tooltip position based on widget geometry and screen bounds."""
@@ -211,6 +147,8 @@ class CustomToolTip(QFrame):
 
     def show_tooltip(self, text, widget_geometry=None, top_level_geometry=None, duration=None):
         """Show tooltip centered below or above the widget."""
+        # Decide before replacing the previous tooltip, which still counts as showing
+        warm = CustomToolTip.is_warm()
         if CustomToolTip._active_tooltip and CustomToolTip._active_tooltip is not self:
             CustomToolTip._active_tooltip.hide()
         CustomToolTip._active_tooltip = self
@@ -220,12 +158,20 @@ class CustomToolTip(QFrame):
 
         if widget_geometry:
             self._base_pos = self._calculate_position(widget_geometry, top_level_geometry)
-            self.move(self._base_pos.x(), self._base_pos.y())
         else:
             return
 
-        self._start_animations(fade_in=True)
+        self.hide_timer.stop()
+        if not self.isVisible():
+            # Start invisible so the first frame is never drawn at full opacity
+            self.setWindowOpacity(0.0)
+            self.move(self._base_pos)
         self.show()
+        # Emerge from the widget it describes: a tooltip below it starts a little higher, one above a little lower
+        below = self._base_pos.y() >= widget_geometry.center().y()
+        offset = QPoint(0, -TOOLTIP_SLIDE_PX if below else TOOLTIP_SLIDE_PX)
+        # Moving along a row of icons: the next tooltip appears at once
+        self._motion.enter(self._base_pos, offset, 0 if warm else TOOLTIP_ENTER_MS)
 
         opts = GlobalState.tooltip_options()
         if opts and opts.blur_effect and opts.blur_effect.enabled:
@@ -242,50 +188,20 @@ class CustomToolTip(QFrame):
             self.hide_timer.start(duration)
 
     def start_fade_out(self):
-        self._start_animations(fade_in=False)
-
-    def _start_animations(self, fade_in=True):
-        """Helper to start both fade and slide animations together."""
-        if self._is_destroyed:
+        """Fade out in place (no slide), then hide and return to the pool."""
+        if self._is_destroyed or not self.isVisible():
             return
+        self.hide_timer.stop()
+        self._motion.exit(QPoint(0, 0), TOOLTIP_EXIT_MS)
 
-        # Ensure animations are created before using them
-        self._ensure_animations_created()
-
-        if fade_in:
-            self.fade_out_animation.stop()
-            self.slide_out_animation.stop()
-            self.set_opacity(0.0)
-            self.set_slide_offset(10)
-            self.fade_in_animation.start()
-            self.slide_in_animation.start()
-        else:
-            self.hide_timer.stop()
-            self.fade_in_animation.stop()
-            self.slide_in_animation.stop()
-            self.fade_out_animation.setStartValue(self.windowOpacity())
-            self.fade_out_animation.setEndValue(0.0)
-            self.slide_out_animation.setStartValue(self._slide_offset)
-            self.slide_out_animation.setEndValue(10)
-            self._fade_out_done = False
-            self._slide_out_done = False
-            self.fade_out_animation.start()
-            self.slide_out_animation.start()
-
-    def _on_fade_out_anim_finished(self):
-        self._fade_out_done = True
-        self._check_hide_complete()
-
-    def _on_slide_out_anim_finished(self):
-        self._slide_out_done = True
-        self._check_hide_complete()
-
-    def _check_hide_complete(self):
-        if self._fade_out_done and self._slide_out_done:
-            self.hide()
-            if CustomToolTip._active_tooltip is self:
-                CustomToolTip._active_tooltip = None
-            CustomToolTip.return_to_pool(self)
+    def _on_motion_finished(self, entered: bool):
+        if entered:
+            return
+        self.hide()
+        CustomToolTip._last_hidden.start()
+        if CustomToolTip._active_tooltip is self:
+            CustomToolTip._active_tooltip = None
+        CustomToolTip.return_to_pool(self)
 
 
 class TooltipEventFilter(QObject):
@@ -400,7 +316,8 @@ class TooltipEventFilter(QObject):
         if obj is self.widget:
             if event.type() == QEvent.Type.Enter:
                 self._mouse_inside = True
-                self.hover_timer.start(self.hover_delay)
+                # Moving along a row of icons: no second wait once a tooltip is already up
+                self.hover_timer.start(0 if CustomToolTip.is_warm() else self.hover_delay)
                 self.hide_timer.stop()
             elif event.type() == QEvent.Type.Leave:
                 self.hover_timer.stop()
