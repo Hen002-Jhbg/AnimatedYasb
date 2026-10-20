@@ -1,9 +1,10 @@
 import ctypes
 
-from PyQt6.QtCore import QEvent, QPoint, QPropertyAnimation, QRect, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import QApplication, QFrame, QVBoxLayout, QWidget
 
+from core.utils.motion import EXIT_SLIDE_PX, POPUP_ENTER_MS, POPUP_EXIT_MS, SLIDE_PX, WindowMotion
 from core.utils.win32.backdrop import enable_blur
 from core.utils.win32.bindings import user32
 from core.widgets.services.systray.systray_widget import DropWidget, IconWidget
@@ -59,10 +60,9 @@ class SystrayPopup(QWidget):
         outer.addWidget(self._grid_widget)
         self.setLayout(outer)
 
-        # Fade animation
-        self._fade_animation = QPropertyAnimation(self, b"windowOpacity")
-        self._fade_animation.setDuration(80)
-        self._fade_animation.finished.connect(self._on_animation_finished)
+        # Same window fade + slide as every other bar popup
+        self._motion = WindowMotion(self)
+        self._motion.finished.connect(self._on_motion_finished)
 
         # Watch timer for native mouse-poll (context-menu interaction)
         self._watch_ticks = 0
@@ -99,6 +99,11 @@ class SystrayPopup(QWidget):
             offset_left=self._popup_config.offset_left,
             offset_top=self._popup_config.offset_top,
         )
+        # Animate only once the popup is sized and placed, so the slide ends exactly at its spot.
+        # open() can also run while a fade-out is still going (drag from the pinned area); the
+        # enter takes that window back, so it is no longer closing.
+        self._is_closing = False
+        self._motion.enter(self.pos(), self._slide_offset(), POPUP_ENTER_MS)
         self._toggle_btn.setChecked(True)
         self._toggle_btn.setText(label_expanded)
 
@@ -156,6 +161,12 @@ class SystrayPopup(QWidget):
     def _popup_rect(self) -> QRect:
         return QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
 
+    def _slide_offset(self, distance: int = SLIDE_PX) -> QPoint:
+        """Offset toward the bar: a popup below the bar slides down into place, one above it slides up."""
+        pos_args = getattr(self, "_pos_args", None)
+        direction = pos_args[1] if pos_args else self._popup_config.direction
+        return QPoint(0, distance if direction == "up" else -distance)
+
     def showEvent(self, event):
         if self._blur:
             enable_blur(
@@ -167,18 +178,10 @@ class SystrayPopup(QWidget):
             )
 
         self._is_closing = False
-        try:
-            if self._fade_animation.state() == QPropertyAnimation.State.Running:
-                self._fade_animation.stop()
-        except Exception:
-            pass
+        # Stay invisible until open() has placed the popup and starts the fade
         self.setWindowOpacity(0.0)
         super().showEvent(event)
         self.activateWindow()
-
-        self._fade_animation.setStartValue(0.0)
-        self._fade_animation.setEndValue(1.0)
-        self._fade_animation.start()
 
     def hide_animated(self):
         """Hide with a fade-out animation."""
@@ -188,29 +191,23 @@ class SystrayPopup(QWidget):
         self._toggle_btn.setChecked(False)
         if self._label_collapsed:
             self._toggle_btn.setText(self._label_collapsed)
-        try:
-            if self._fade_animation.state() == QPropertyAnimation.State.Running:
-                self._fade_animation.stop()
-        except Exception:
-            pass
-
-        current_opacity = self.windowOpacity()
-        if current_opacity <= 0.0:
-            current_opacity = 1.0
-            self.setWindowOpacity(1.0)
 
         self._is_closing = True
-        self._fade_animation.setStartValue(current_opacity)
-        self._fade_animation.setEndValue(0.0)
-        self._fade_animation.start()
+        self._motion.exit(self._slide_offset(EXIT_SLIDE_PX), POPUP_EXIT_MS)
+
+    def _on_motion_finished(self, entered: bool):
+        if not entered:
+            self._on_animation_finished()
 
     def _on_animation_finished(self):
         if self._is_closing:
             QWidget.hide(self)
+            self.setWindowOpacity(1.0)
             self._is_closing = False
 
     def hideEvent(self, event):
         self._watch_timer.stop()
+        self._motion.stop()
         super().hideEvent(event)
         self.closed.emit()
 
@@ -227,6 +224,9 @@ class SystrayPopup(QWidget):
         self._popup_content.setGeometry(0, 0, self.width(), self.height())
         if hasattr(self, "_pos_args"):
             self._set_position(*self._pos_args)
+            if self._motion.is_running():
+                # _set_position() put the window at its new resting spot; continue the animation from there
+                self._motion.retarget(self.pos())
         super().resizeEvent(event)
 
     def changeEvent(self, event):
