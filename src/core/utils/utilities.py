@@ -582,9 +582,24 @@ class PopupWidget(QWidget):
                 if menu.isVisible():
                     menu.close()
 
-            self.hide_animated()
+            if self._is_on_trigger(global_pos):
+                # A click on the widget that opened this popup toggles it closed, with the usual fade
+                self.hide_animated()
+                return True
+
+            # A click on anything else (another bar widget) is meant for that thing. Hide at once: Qt then
+            # replays this press to whatever is under the cursor. A fading popup would keep the mouse grab
+            # until the fade ends and eat the click, so switching popups used to take two clicks.
+            self.hide()
             return True
         return super().eventFilter(obj, event)
+
+    def _is_on_trigger(self, global_pos: QPoint) -> bool:
+        """True when global_pos is on the bar widget this popup belongs to."""
+        trigger = self._parent
+        if trigger is None or not is_valid_qobject(trigger) or not trigger.isVisible():
+            return False
+        return trigger.rect().contains(trigger.mapFromGlobal(global_pos))
 
     def set_auto_close_enabled(self, enabled: bool):
         """Enable/disable auto-close behavior when clicking outside."""
