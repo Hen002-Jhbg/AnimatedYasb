@@ -8,7 +8,6 @@ from PyQt6.QtCore import (
     QEvent,
     QPoint,
     QPointF,
-    QPropertyAnimation,
     QRectF,
     Qt,
     QThreadPool,
@@ -22,14 +21,15 @@ from PyQt6.QtWidgets import (
 )
 
 from core.bar_helper import GlobalState
-from core.utils.motion import SpringMotion
+from core.utils.motion import SpringMotion, WindowMotion
 from core.utils.win32.utils import apply_qmenu_style
 from core.utils.win32.window_actions import force_foreground_focus
 from core.widgets.services.wallpapers.images import FolderScanner, ImageLoader
 from core.widgets.services.wallpapers.manager import WallpaperManager
 
-FADE_IN_DURATION = 80
-FADE_OUT_DURATION = 120
+# Opening is mostly a hotkey, so both stay short; closing is the system answering, so it is the quicker one
+FADE_IN_DURATION = 150
+FADE_OUT_DURATION = 100
 
 # Carousel spring, critically damped (no overshoot): how long one step takes, in seconds. Holding an
 # arrow key keeps the cards gliding, because the spring keeps its speed when the target moves on.
@@ -156,24 +156,28 @@ class GalleryWindow(QMainWindow):
                 widget.fade_out_and_close_gallery()
 
         self.initUI(parent, screen)
-        self.fade_in_animation = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_in_animation.setDuration(FADE_IN_DURATION)
-        self.fade_in_animation.setStartValue(0)
-        self.fade_in_animation.setEndValue(1)
-        self.fade_in_animation.start()
+        # Same fade as the popups: shared curve and ticker, from the current opacity, clock started at the
+        # first paint. The gallery is centred like a dialog, so it fades in place.
+        self._motion = WindowMotion(self)
+        self._motion.finished.connect(self._on_motion_finished)
+        self.setWindowOpacity(0.0)
         self.show()
+        self._motion.enter(self.pos(), QPoint(0, 0), FADE_IN_DURATION)
 
     def fade_out_and_close_gallery(self) -> None:
         if self.is_closing:
             return
         self.is_closing = True
+        motion = getattr(self, "_motion", None)
+        if motion is None:
+            self._on_fade_out_finished()
+            return
+        # Starts from wherever the fade-in is, so closing right after opening never flashes to full
+        motion.exit(QPoint(0, 0), FADE_OUT_DURATION)
 
-        self.fade_out_animation = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_out_animation.setDuration(FADE_OUT_DURATION)
-        self.fade_out_animation.setStartValue(1)
-        self.fade_out_animation.setEndValue(0)
-        self.fade_out_animation.finished.connect(self._on_fade_out_finished)
-        self.fade_out_animation.start()
+    def _on_motion_finished(self, entered: bool) -> None:
+        if not entered:
+            self._on_fade_out_finished()
 
 
 class Placement(NamedTuple):
