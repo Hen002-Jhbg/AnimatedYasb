@@ -6,8 +6,8 @@ contains moves with it and nothing is resized or re-laid out while it runs. Valu
 a single number (a scroll offset, a height) on the same curve and ticker. SpringMotion moves a
 number on a critically damped spring for motion that is retargeted often, like a carousel.
 SnapshotMotion plays a popup's entrance and exit on a copy of it drawn at sub-pixel position and
-scale, because a real window can only sit on whole pixels. WidthReveal opens and closes a bar
-widget by its width, so the widgets next to it slide instead of jumping.
+scale, because a real window can only sit on whole pixels. WidthReveal animates a bar widget's
+width (opening, closing, and content that changes size), so the widgets next to it slide instead of jumping.
 """
 
 import ctypes
@@ -327,13 +327,14 @@ class ValueMotion(QObject):
 
 
 class WidthReveal(QObject):
-    """Opens and closes a bar widget by its width, so the widgets next to it slide instead of jumping.
+    """Animates a bar widget's width, so the widgets next to it slide instead of jumping.
 
-    Opening shows the widget at zero width and grows it to its natural width, following it if the
-    content changes meanwhile, then lifts the limit. Closing shrinks it to zero and then hides it;
-    with hide_when_closed=False it stays shown at zero width instead (the audio visualizer must keep
-    getting show and hide events). Reversing mid-way continues from the current width. A widget that
-    is not on screen opens or closes at once, and so does everything with Windows "Animation effects" off.
+    Opening shows the widget at zero width and grows it to its natural width; closing shrinks it to
+    zero and then hides it (with hide_when_closed=False it stays shown at zero width instead: the audio
+    visualizer must keep getting show and hide events). While it is open, a change of its natural
+    width animates too (a new media title, a longer count): the width is held where it is and moves to
+    the new size. All of these turn around mid-way from the current width. A widget that is not on
+    screen jumps, and so does everything with Windows "Animation effects" off.
     """
 
     def __init__(self, widget: QWidget, is_open: bool = True, hide_when_closed: bool = True):
@@ -341,73 +342,120 @@ class WidthReveal(QObject):
         self._widget = widget
         self._open = is_open
         self._hide_when_closed = hide_when_closed
-        self._progress = 1.0 if is_open else 0.0
+        self._width = 0.0
+        self._target = 0.0
         self._min_width = widget.minimumWidth()
+        self._on_closed: Callable[[], None] | None = None
         self._motion = ValueMotion(widget, ease_in_out())
         self._motion.valueChanged.connect(self._apply)
         self._motion.finished.connect(self._on_finished)
+        widget.installEventFilter(self)
 
     def is_open(self) -> bool:
         return self._open
 
+    def eventFilter(self, obj, event) -> bool:
+        # The content changed size: this arrives before the widget is re-laid out, so the width can be
+        # held where it is and moved to the new size instead of jumping there
+        if obj is self._widget and event.type() == QEvent.Type.LayoutRequest:
+            self._follow_content()
+        return False
+
     def open(self) -> None:
         """Grow to the natural width, showing the widget first."""
+        self._on_closed = None
         if self._open:
             return
         self._open = True
-        start = self._progress if self._motion.is_running() else 0.0
-        if not self._motion.is_running():
-            self._min_width = self._widget.minimumWidth()
-        self._widget.setMinimumWidth(0)
+        start = self._width if self._motion.is_running() else 0.0
         if self._hide_when_closed and self._widget.isHidden():
             self._widget.setMaximumWidth(0)
             self._widget.show()
-        self._motion.start(start, 1.0, round(EXPAND_MS * (1.0 - start)))
+        self._run(start, self._natural())
 
-    def close(self) -> None:
-        """Shrink to zero width, then hide (unless the widget has to stay shown)."""
+    def close(self, on_closed: Callable[[], None] | None = None) -> None:
+        """Shrink to zero width, then hide (unless the widget has to stay shown) and call on_closed.
+
+        The content stays as it is while it shrinks, so a caller can clear it in on_closed.
+        """
         if not self._open:
-            return
-        if not self._widget.isVisible():
-            self.set_open(False)
+            if self._motion.is_running():
+                self._on_closed = on_closed
+            elif on_closed is not None:
+                on_closed()
             return
         self._open = False
-        start = self._progress if self._motion.is_running() else 1.0
-        if not self._motion.is_running():
-            self._min_width = self._widget.minimumWidth()
-        self._widget.setMinimumWidth(0)
-        self._motion.start(start, 0.0, round(COLLAPSE_MS * start))
+        self._on_closed = on_closed
+        if not self._widget.isVisible():
+            self._motion.stop()
+            self._finish()
+            return
+        start = self._width if self._motion.is_running() else float(self._widget.width())
+        self._run(start, 0.0)
 
     def set_open(self, is_open: bool) -> None:
         """Jump to open or closed without animating (startup, or a widget that is not on screen)."""
         self._motion.stop()
         self._open = is_open
-        self._progress = 1.0 if is_open else 0.0
         self._finish()
 
-    def _apply(self, progress: float) -> None:
-        self._progress = progress
-        width = max(0, round(progress * self._widget.sizeHint().width()))
-        if self._widget.maximumWidth() != width:
-            self._widget.setMaximumWidth(width)
+    def _natural(self) -> float:
+        return float(self._widget.sizeHint().width())
+
+    def _follow_content(self) -> None:
+        if not self._open or not self._widget.isVisible():
+            return
+        target = self._natural()
+        if self._motion.is_running():
+            if abs(target - self._target) >= 1:
+                self._run(self._width, target)
+            return
+        current = float(self._widget.width())
+        if abs(target - current) >= 1:
+            self._run(current, target)
+
+    def _run(self, start: float, end: float) -> None:
+        if not self._motion.is_running():
+            self._min_width = self._widget.minimumWidth()
+        self._target = end
+        self._widget.setMinimumWidth(0)
+        self._motion.start(start, end, EXPAND_MS if end > start else COLLAPSE_MS)
+
+    def _apply(self, width: float) -> None:
+        self._width = width
+        # Both limits: a maximum alone cannot hold a widget whose content just got narrower
+        limit = max(0, round(width))
+        if self._widget.minimumWidth() != limit or self._widget.maximumWidth() != limit:
+            self._widget.setFixedWidth(limit)
 
     def _on_finished(self) -> None:
+        if self._open and abs(self._natural() - self._width) >= 1:
+            # The content changed again on the last frame: keep following it
+            self._run(self._width, self._natural())
+            return
         self._finish()
 
     def _finish(self) -> None:
         if self._open:
+            self._width = self._natural()
             self._widget.setMaximumWidth(_NO_SIZE_LIMIT)
             self._widget.setMinimumWidth(self._min_width)
             if self._hide_when_closed and self._widget.isHidden():
                 self._widget.show()
-        elif self._hide_when_closed:
-            self._widget.hide()
-            self._widget.setMaximumWidth(_NO_SIZE_LIMIT)
-            self._widget.setMinimumWidth(self._min_width)
         else:
-            self._widget.setMinimumWidth(0)
-            self._widget.setMaximumWidth(0)
+            self._width = 0.0
+            if self._hide_when_closed:
+                self._widget.hide()
+                self._widget.setMaximumWidth(_NO_SIZE_LIMIT)
+                self._widget.setMinimumWidth(self._min_width)
+            else:
+                self._widget.setMinimumWidth(0)
+                self._widget.setMaximumWidth(0)
         self._widget.updateGeometry()
+        if not self._open:
+            callback, self._on_closed = self._on_closed, None
+            if callback is not None:
+                callback()
 
 
 class SpringMotion(QObject):

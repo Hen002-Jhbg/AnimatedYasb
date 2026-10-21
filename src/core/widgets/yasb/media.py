@@ -640,28 +640,34 @@ class MediaWidget(BaseWidget):
             if not self.config.controls_only:
                 active_label.show()
 
+        elif self.config.hide_empty:
+            # Keep the last title on screen while the widget closes, then clear it
+            self._reveal.close(on_closed=self._clear_session_display)
         else:
-            # Hide thumbnail and label fields
-            self._thumbnail_label.hide()
-            active_label.hide()
-            active_label.setText("")
-            if not self.config.controls_hide:
-                if self._play_label is not None:
-                    self._play_label.setText(self.config.icons.play)
-                    self._play_label.setProperty("class", "btn play disabled")
-                    refresh_widget_style(self._play_label)
+            self._clear_session_display()
 
-                if self._prev_label is not None:
-                    self._prev_label.setProperty("class", "btn prev disabled")
-                    refresh_widget_style(self._prev_label)
+    def _clear_session_display(self):
+        """No media session: hide the thumbnail and label, and grey out the controls."""
+        if self.current_session is not None:
+            # A new session arrived while the widget was closing
+            return
+        active_label = self._label_alt if self._show_alt_label else self._label
+        self._thumbnail_label.hide()
+        active_label.hide()
+        active_label.setText("")
+        if not self.config.controls_hide:
+            if self._play_label is not None:
+                self._play_label.setText(self.config.icons.play)
+                self._play_label.setProperty("class", "btn play disabled")
+                refresh_widget_style(self._play_label)
 
-                if self._next_label is not None:
-                    self._next_label.setProperty("class", "btn next disabled")
-                    refresh_widget_style(self._next_label)
+            if self._prev_label is not None:
+                self._prev_label.setProperty("class", "btn prev disabled")
+                refresh_widget_style(self._prev_label)
 
-            # If we want to hide the widget when no music is playing, hide it!
-            if self.config.hide_empty:
-                self._reveal.close()
+            if self._next_label is not None:
+                self._next_label.setProperty("class", "btn next disabled")
+                refresh_widget_style(self._next_label)
 
     def _on_playback_info_changed(self):
         if self.current_session is None or not self.current_session.playback_ready:
