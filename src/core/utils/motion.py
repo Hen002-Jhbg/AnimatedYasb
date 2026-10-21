@@ -834,6 +834,8 @@ class SnapshotGhost(QWidget):
     """
 
     finished = pyqtSignal()
+    # Emitted when the copy is painted for the first time (it reaches the screen right after)
+    painted = pyqtSignal()
 
     def __init__(self, window: QWidget, origin: QPointF):
         super().__init__(
@@ -893,7 +895,9 @@ class SnapshotGhost(QWidget):
         self.finished.emit()
 
     def paintEvent(self, event) -> None:
-        self._painted = True
+        if not self._painted:
+            self._painted = True
+            self.painted.emit()
         opacity, scale, dx, dy = self._springs.values
         opacity = min(1.0, opacity)
         if opacity <= 0.0 or self._pixmap.isNull():
@@ -967,6 +971,11 @@ class SnapshotMotion(QObject):
     def releases_on_exit(self) -> bool:
         return self._release_on_exit
 
+    def _release_window(self) -> None:
+        # Still leaving (not turned around in the meantime): the copy has taken over, the window can go
+        if not self._entering and self._window.isVisible():
+            self._window.setVisible(False)
+
     def is_running(self) -> bool:
         return self._ghost is not None and self._ghost.is_running()
 
@@ -1018,8 +1027,13 @@ class SnapshotMotion(QObject):
             ghost.refresh(self._window)
         ghost.show()
         if self._release_on_exit:
-            # Give the keyboard and mouse back at once; only the copy is left to fade
-            self._window.setVisible(False)
+            # Give the keyboard and mouse back as soon as the copy is on screen (hiding the window before
+            # that leaves one empty frame); from then on only the copy is left to fade
+            if ghost._painted:
+                self._window.setVisible(False)
+            else:
+                ghost.painted.connect(lambda: QTimer.singleShot(0, self._release_window))
+                QTimer.singleShot(_FIRST_PAINT_WAIT_MS, self._release_window)
         else:
             # The real window stays shown so it keeps the mouse grab (the closing click must not reach
             # the widget that opened it), but only the copy is visible
