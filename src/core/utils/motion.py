@@ -88,6 +88,13 @@ def ease_out() -> QEasingCurve:
     return curve
 
 
+def ease_drawer() -> QEasingCurve:
+    """iOS-like drawer curve: cubic-bezier(0.32, 0.72, 0, 1), for panels that slide in from a screen edge."""
+    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
+    curve.addCubicBezierSegment(QPointF(0.32, 0.72), QPointF(0.0, 1.0), QPointF(1.0, 1.0))
+    return curve
+
+
 def animations_enabled() -> bool:
     """False when Windows "Animation effects" is off (Settings > Accessibility > Visual effects)."""
     enabled = ctypes.c_int(1)

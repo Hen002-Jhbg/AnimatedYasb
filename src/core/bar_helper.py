@@ -11,9 +11,9 @@ import win32gui
 import win32process
 from PyQt6.QtCore import (
     QAbstractNativeEventFilter,
-    QEasingCurve,
     QEvent,
     QObject,
+    QPoint,
     QPropertyAnimation,
     QRect,
     Qt,
@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 from win32con import HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE
 
 from core.utils.controller import exit_application, reload_application
+from core.utils.motion import ValueMotion, ease_drawer
 from core.utils.utilities import AnimatedContextMenu, refresh_widget_style
 from core.utils.win32.app_bar import APPBAR_CALLBACK_MESSAGE, AppBarNotify
 from core.utils.win32.bindings import SetWindowPos
@@ -77,23 +78,33 @@ class GlobalState:
 
 
 class BarAnimationManager(QObject):
-    """Handles bar show/hide animations."""
+    """Handles bar show/hide animations.
+
+    One progress value drives the motion, 0 hidden and 1 shown, on the same ticker as the popups.
+    Showing while a hide is running (or the other way round) turns around from where the bar is
+    instead of waiting for the end. Showing slides in on the drawer curve; hiding is the system
+    answering, so it is quicker and starts fast instead of easing in.
+    """
 
     def __init__(self, bar_widget: QWidget, parent=None):
         super().__init__(parent)
         self.bar_widget = bar_widget
-        self._animation = None
         self._target_geo = None
-        self._pending_action = None
+        self._mode = "fade"
+        self._showing = True
+        self._progress = 1.0
+        self._rest_pos = QPoint()
+        self._hidden_pos = QPoint()
+        self._show_motion = ValueMotion(bar_widget, ease_drawer())
+        self._hide_motion = ValueMotion(bar_widget)
+        for motion in (self._show_motion, self._hide_motion):
+            motion.valueChanged.connect(self._apply)
+            motion.finished.connect(self._on_finished)
 
     def show_bar(self):
         if not self.bar_widget._animation.get("enabled"):
             self.bar_widget.show()
             return
-        if self._animation and self._animation.state() == QPropertyAnimation.State.Running:
-            self._pending_action = "show"
-            return
-        self._pending_action = None
         if self.bar_widget._animation.get("type") == "fade":
             self._start_fade(True)
         else:
@@ -105,33 +116,25 @@ class BarAnimationManager(QObject):
             self.bar_widget.hide()
             self.bar_widget._skip_animation = False
             return
-        if self._animation and self._animation.state() == QPropertyAnimation.State.Running:
-            self._pending_action = "hide"
-            return
-        self._pending_action = None
         if self.bar_widget._animation.get("type") == "fade":
             self._start_fade(False)
         else:
             self._start_slide(False)
 
+    def _is_running(self) -> bool:
+        return self._show_motion.is_running() or self._hide_motion.is_running()
+
     def _stop_animation(self):
-        if self._animation and self._animation.state() == QPropertyAnimation.State.Running:
-            self._animation.stop()
-        self._animation = None
+        self._show_motion.stop()
+        self._hide_motion.stop()
 
     def _start_fade(self, show: bool):
-        self._stop_animation()
-        duration = self.bar_widget._animation.get("duration", 300)
-        self._animation = QPropertyAnimation(self.bar_widget, b"windowOpacity")
-        self._animation.setDuration(duration)
-        self._animation.setStartValue(0.0 if show else 1.0)
-        self._animation.setEndValue(1.0 if show else 0.0)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutQuad if show else QEasingCurve.Type.InQuad)
-        self._animation.finished.connect(self._on_show_finished if show else self._on_hide_finished)
-        if show:
-            self.bar_widget.setWindowOpacity(0.0)
+        if not self._is_running():
+            self._mode = "fade"
+            self._target_geo = None
+        self._run(show)
+        if show and not self.bar_widget.isVisible():
             self.bar_widget.show()
-        self._animation.start()
 
     def _slide_is_blocked(self, hidden: QRect) -> bool:
         """Is another screen sitting where the bar would slide out of view?
@@ -144,45 +147,69 @@ class BarAnimationManager(QObject):
         return any(screen.geometry().intersects(hidden) for screen in QApplication.screens())
 
     def _start_slide(self, show: bool):
-        self._stop_animation()
         bar = self.bar_widget
+        if not self._is_running():
+            bar.position_bar()
+            geo = bar.geometry()
+            self._target_geo = (geo.x(), geo.y(), geo.width(), geo.height())
 
-        bar.position_bar()
-        geo = bar.geometry()
-        self._target_geo = (geo.x(), geo.y(), geo.width(), geo.height())
+            screen_geo = bar.screen().geometry()
+            if bar._alignment["position"] == "top":
+                hidden_y = screen_geo.y() - geo.height()
+            else:
+                hidden_y = screen_geo.y() + screen_geo.height()
+            hidden = QRect(geo.x(), hidden_y, geo.width(), geo.height())
 
-        screen_geo = bar.screen().geometry()
-        if bar._alignment["position"] == "top":
-            hidden_y = screen_geo.y() - geo.height()
-        else:
-            hidden_y = screen_geo.y() + screen_geo.height()
-        hidden = QRect(geo.x(), hidden_y, geo.width(), geo.height())
-
-        if self._slide_is_blocked(hidden):
-            self._start_fade(show)
-            return
-
-        resting_pos = geo.topLeft()
-        hidden_pos = hidden.topLeft()
-        if show:
-            bar.move(hidden_pos)
-
-        self._animation = QPropertyAnimation(bar, b"pos", bar)
-        self._animation.setDuration(bar._animation.get("duration", 300))
-        self._animation.setStartValue(hidden_pos if show else resting_pos)
-        self._animation.setEndValue(resting_pos if show else hidden_pos)
-        self._animation.setEasingCurve(QEasingCurve.Type.OutQuad if show else QEasingCurve.Type.InQuad)
-        self._animation.finished.connect(self._on_show_finished if show else self._on_hide_finished)
-        self._animation.start()
-
+            if self._slide_is_blocked(hidden):
+                self._start_fade(show)
+                return
+            self._mode = "slide"
+            self._rest_pos = geo.topLeft()
+            self._hidden_pos = hidden.topLeft()
+        self._run(show)
         if show and not bar.isVisible():
             bar.show()
+
+    def _run(self, show: bool):
+        """Head for shown (1) or hidden (0); a reversal continues from the current progress."""
+        if self._is_running():
+            if show == self._showing:
+                return
+            start = self._progress
+        else:
+            start = 0.0 if show else 1.0
+        self._stop_animation()
+        self._showing = show
+        end = 1.0 if show else 0.0
+        duration = self.bar_widget._animation.get("duration", 300)
+        if not show:
+            # The system answering: two thirds of the configured time (300 ms -> 200 ms)
+            duration = round(duration * 2 / 3)
+        # Turning around part-way only covers the part of the way that is left
+        duration = round(duration * abs(end - start))
+        motion = self._show_motion if show else self._hide_motion
+        motion.start(start, end, duration)
+
+    def _apply(self, value: float) -> None:
+        self._progress = value
+        if self._mode == "slide":
+            x = round(self._hidden_pos.x() + (self._rest_pos.x() - self._hidden_pos.x()) * value)
+            y = round(self._hidden_pos.y() + (self._rest_pos.y() - self._hidden_pos.y()) * value)
+            if self.bar_widget.x() != x or self.bar_widget.y() != y:
+                self.bar_widget.move(x, y)
+        else:
+            self.bar_widget.setWindowOpacity(value)
+
+    def _on_finished(self):
+        if self._showing:
+            self._on_show_finished()
+        else:
+            self._on_hide_finished()
 
     def _on_show_finished(self):
         if self._target_geo:
             self.bar_widget.setGeometry(*self._target_geo)
-        self._animation = None
-        self._process_pending()
+        self.bar_widget.setWindowOpacity(1.0)
 
         # Check if mouse left during the animation
         if (
@@ -206,19 +233,8 @@ class BarAnimationManager(QObject):
         self.bar_widget.hide()
         self.bar_widget._skip_animation = False
         self.bar_widget.setWindowOpacity(1.0)
-        self._animation = None
-        self._process_pending()
-
-    def _process_pending(self):
-        action = self._pending_action
-        self._pending_action = None
-        if action == "show" and not self.bar_widget.isVisible():
-            self.show_bar()
-        elif action == "hide" and self.bar_widget.isVisible():
-            self.hide_bar()
 
     def cleanup(self):
-        self._pending_action = None
         self._stop_animation()
 
 
