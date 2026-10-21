@@ -33,7 +33,7 @@ from PyQt6.QtWidgets import (
 from win32con import HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE
 
 from core.utils.controller import exit_application, reload_application
-from core.utils.motion import ValueMotion, ease_drawer
+from core.utils.motion import ValueMotion
 from core.utils.utilities import AnimatedContextMenu, refresh_widget_style
 from core.utils.win32.app_bar import APPBAR_CALLBACK_MESSAGE, AppBarNotify
 from core.utils.win32.bindings import SetWindowPos
@@ -80,10 +80,9 @@ class GlobalState:
 class BarAnimationManager(QObject):
     """Handles bar show/hide animations.
 
-    One progress value drives the motion, 0 hidden and 1 shown, on the same ticker as the popups.
-    Showing while a hide is running (or the other way round) turns around from where the bar is
-    instead of waiting for the end. Showing slides in on the drawer curve; hiding is the system
-    answering, so it is quicker and starts fast instead of easing in.
+    One progress value drives the motion, 0 hidden and 1 shown, on the bar's spring (motion.SPRINGS).
+    Showing while a hide is running (or the other way round) turns around from where the bar is, at the
+    speed it has, instead of waiting for the end. Hiding is the system answering, so its spring is quicker.
     """
 
     def __init__(self, bar_widget: QWidget, parent=None):
@@ -95,11 +94,9 @@ class BarAnimationManager(QObject):
         self._progress = 1.0
         self._rest_pos = QPoint()
         self._hidden_pos = QPoint()
-        self._show_motion = ValueMotion(bar_widget, ease_drawer())
-        self._hide_motion = ValueMotion(bar_widget)
-        for motion in (self._show_motion, self._hide_motion):
-            motion.valueChanged.connect(self._apply)
-            motion.finished.connect(self._on_finished)
+        self._motion = ValueMotion(bar_widget, "bar", precision=0.002)
+        self._motion.valueChanged.connect(self._apply)
+        self._motion.finished.connect(self._on_finished)
 
     def show_bar(self):
         if not self.bar_widget._animation.get("enabled"):
@@ -122,11 +119,10 @@ class BarAnimationManager(QObject):
             self._start_slide(False)
 
     def _is_running(self) -> bool:
-        return self._show_motion.is_running() or self._hide_motion.is_running()
+        return self._motion.is_running()
 
     def _stop_animation(self):
-        self._show_motion.stop()
-        self._hide_motion.stop()
+        self._motion.stop()
 
     def _start_fade(self, show: bool):
         if not self._is_running():
@@ -171,24 +167,17 @@ class BarAnimationManager(QObject):
             bar.show()
 
     def _run(self, show: bool):
-        """Head for shown (1) or hidden (0); a reversal continues from the current progress."""
+        """Head for shown (1) or hidden (0); a reversal keeps the bar's position and speed."""
         if self._is_running():
             if show == self._showing:
                 return
             start = self._progress
         else:
             start = 0.0 if show else 1.0
-        self._stop_animation()
         self._showing = show
-        end = 1.0 if show else 0.0
+        # duration: 0 in the config still means no animation; any other value uses the bar's spring
         duration = self.bar_widget._animation.get("duration", 300)
-        if not show:
-            # The system answering: two thirds of the configured time (300 ms -> 200 ms)
-            duration = round(duration * 2 / 3)
-        # Turning around part-way only covers the part of the way that is left
-        duration = round(duration * abs(end - start))
-        motion = self._show_motion if show else self._hide_motion
-        motion.start(start, end, duration)
+        self._motion.start(start, 1.0 if show else 0.0, duration, exiting=not show)
 
     def _apply(self, value: float) -> None:
         self._progress = value

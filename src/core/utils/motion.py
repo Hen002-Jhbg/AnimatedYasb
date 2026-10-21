@@ -1,9 +1,12 @@
 """Shared motion for popups, context menus and the rest of the bar.
 
-One curve and one duration scale, so everything on the bar moves the same way.
+Everything moves on springs, the way Apple's interfaces do: a spring has no fixed duration, it keeps
+its velocity when its target changes (so turning around mid-way never hits a wall), and it settles
+without overshoot at damping 1.0. Each kind of surface has its spring in SPRINGS, and
+~/.config/yasb/motion-tuning.json can override them while YASB runs.
 WindowMotion animates the top-level window itself (opacity + position), so whatever the window
 contains moves with it and nothing is resized or re-laid out while it runs. ValueMotion animates
-a single number (a scroll offset, a height) on the same curve and ticker. SpringMotion moves a
+a single number (a scroll offset, a height) on the same springs and ticker. SpringMotion moves a
 number on a critically damped spring for motion that is retargeted often, like a carousel.
 SnapshotMotion plays a popup's entrance and exit on a copy of it drawn at sub-pixel position and
 scale, because a real window can only sit on whole pixels. WidthReveal animates a bar widget's
@@ -11,6 +14,7 @@ width (opening, closing, and content that changes size), so the widgets next to 
 """
 
 import ctypes
+import json
 import logging
 import math
 import os
@@ -116,36 +120,214 @@ def animations_enabled() -> bool:
     return bool(enabled.value) if ok else True
 
 
-class WindowMotion(QObject):
-    """Fades and slides a top-level window between a resting position and an offset from it.
+# Springs in Apple's two terms: response is roughly how long the value takes to reach its target, in
+# seconds, and damping 1.0 settles without overshoot (lower adds a little bounce). Per kind of surface:
+# (entering response, leaving response, damping). Leaving is quicker: it is the interface answering.
+SPRINGS = {
+    "popup": (0.28, 0.18, 1.0),
+    "menu": (0.24, 0.16, 1.0),
+    "tooltip": (0.22, 0.14, 1.0),
+    "gallery": (0.26, 0.16, 1.0),
+    "bar": (0.42, 0.24, 1.0),
+    "width": (0.34, 0.26, 1.0),
+    "section": (0.32, 0.24, 1.0),
+}
 
-    Starting a new animation (or retargeting) picks up from the current opacity and position,
-    so reversing mid-way never jumps. The clock starts only after a newly shown window has
-    painted its first frame, so a slow first paint cannot swallow the start of the motion.
+# Live tuning while YASB runs: this JSON overrides any surface, for example
+# {"popup": {"response": 0.3, "exit_response": 0.2, "damping": 1.0}}. It is read again when it changes.
+_TUNING_FILE = os.path.join(os.path.expanduser("~"), ".config", "yasb", "motion-tuning.json")
+_tuning_state: dict = {"mtime": None, "data": {}}
+
+
+def _tuning() -> dict:
+    if os.environ.get("YASB_MOTION_NO_TUNING"):
+        return {}
+    try:
+        mtime = os.stat(_TUNING_FILE).st_mtime
+    except OSError:
+        _tuning_state.update(mtime=None, data={})
+        return {}
+    if mtime != _tuning_state["mtime"]:
+        _tuning_state["mtime"] = mtime
+        try:
+            with open(_TUNING_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            _tuning_state["data"] = data if isinstance(data, dict) else {}
+        except Exception as e:
+            logging.warning("motion-tuning.json ignored: %s", e)
+            _tuning_state["data"] = {}
+    return _tuning_state["data"]
+
+
+def spring_params(surface: str, exiting: bool = False) -> tuple[float, float]:
+    """(response in seconds, damping ratio) of a surface's spring, with any live override applied."""
+    entering, leaving, damping = SPRINGS[surface]
+    response = leaving if exiting else entering
+    override = _tuning().get(surface)
+    if isinstance(override, dict):
+        try:
+            response = float(override.get("exit_response" if exiting else "response", response))
+            damping = float(override.get("damping", damping))
+        except (TypeError, ValueError):
+            pass
+    return max(0.02, response), min(1.0, max(0.2, damping))
+
+
+def _spring_step(offset: float, velocity: float, omega: float, damping: float, dt: float) -> tuple[float, float]:
+    """Exact step of a damped spring over dt seconds, from its offset to the target and its velocity."""
+    if damping >= 0.999:
+        b = velocity + omega * offset
+        decay = math.exp(-omega * dt)
+        return (offset + b * dt) * decay, (velocity - omega * b * dt) * decay
+    a = damping * omega
+    wd = omega * math.sqrt(1.0 - damping * damping)
+    decay = math.exp(-a * dt)
+    c, s = math.cos(wd * dt), math.sin(wd * dt)
+    b = (velocity + a * offset) / wd
+    return decay * (offset * c + b * s), decay * ((b * wd - a * offset) * c - (offset * wd + a * b) * s)
+
+
+class SpringGroup(QObject):
+    """A few numbers, each on its own spring toward a target, sharing one ticker at the screen's rate.
+
+    animate() while running keeps every number's position and velocity and only changes the targets,
+    so a reversal continues the motion instead of stopping dead. It settles when every number is
+    within its precision of its target (and at rest), and only then snaps them exactly onto it.
+    """
+
+    changed = pyqtSignal()
+    settled = pyqtSignal()
+
+    def __init__(self, widget: QWidget, count: int):
+        super().__init__(widget)
+        self._widget = widget
+        self.values = [0.0] * count
+        self.velocities = [0.0] * count
+        self.targets = [0.0] * count
+        self._precisions = [0.001] * count
+        self._omega = 2.0 * math.pi / 0.3
+        self._damping = 1.0
+        self._hold: Callable[[], bool] | None = None
+        self._clock = QElapsedTimer()
+        self._wait = QElapsedTimer()
+        self._last_ms = 0
+        self.ticks = 0
+        self._timer = QTimer(self)
+        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._timer.timeout.connect(self._tick)
+
+    def is_running(self) -> bool:
+        return self._timer.isActive()
+
+    def elapsed_ms(self) -> int:
+        return self._clock.elapsed() if self._clock.isValid() else 0
+
+    def interval_ms(self) -> int:
+        return self._timer.interval()
+
+    def jump(self, values) -> None:
+        """Sit at values, at rest, without animating."""
+        self._timer.stop()
+        self.values = [float(v) for v in values]
+        self.velocities = [0.0] * len(self.values)
+        self.targets = list(self.values)
+        self.changed.emit()
+
+    def shift(self, deltas) -> None:
+        """Move the values and their targets together (the resting place itself moved)."""
+        self.values = [v + d for v, d in zip(self.values, deltas)]
+        self.targets = [t + d for t, d in zip(self.targets, deltas)]
+        self.changed.emit()
+
+    def animate(self, targets, response: float, damping: float = 1.0, precisions=None, hold=None) -> None:
+        """Head for targets from wherever the numbers are, keeping their velocity.
+
+        While hold() returns True (a new window not painted yet, for at most 50 ms) no time passes,
+        so a slow first paint cannot swallow the start of the motion.
+        """
+        self.targets = [float(t) for t in targets]
+        self._omega = 2.0 * math.pi / max(0.02, response)
+        self._damping = damping
+        if precisions is not None:
+            self._precisions = list(precisions)
+        if not self._timer.isActive():
+            self.ticks = 0
+            self._hold = hold
+            self._wait.start()
+            self._clock.start()
+            self._last_ms = 0
+            self._timer.setInterval(tick_interval_ms(self._widget))
+            self._timer.start()
+
+    def stop(self) -> None:
+        """Stop where it is, at rest, without emitting settled."""
+        self._timer.stop()
+        self.velocities = [0.0] * len(self.values)
+
+    def _tick(self) -> None:
+        now = self._clock.elapsed()
+        if self._hold is not None:
+            if self._hold() and self._wait.elapsed() < _FIRST_PAINT_WAIT_MS:
+                self._last_ms = now
+                return
+            self._hold = None
+        dt = (now - self._last_ms) / 1000.0
+        self._last_ms = now
+        if dt <= 0:
+            return
+        self.ticks += 1
+        done = True
+        omega, damping = self._omega, self._damping
+        for i, target in enumerate(self.targets):
+            x, v = _spring_step(self.values[i] - target, self.velocities[i], omega, damping, dt)
+            self.values[i] = target + x
+            self.velocities[i] = v
+            precision = self._precisions[i]
+            if abs(x) >= precision or abs(v) >= precision * omega:
+                done = False
+        if done:
+            self._timer.stop()
+            self.values = list(self.targets)
+            self.velocities = [0.0] * len(self.values)
+        self.changed.emit()
+        if done:
+            self.settled.emit()
+
+
+def _log_spring(kind: str, response: float, springs: SpringGroup) -> None:
+    if os.path.exists(_DEBUG_FLAG):
+        logging.info(
+            "%s spring %.2f s: settled in %d ms, %d ticks at %d ms",
+            kind,
+            response,
+            springs.elapsed_ms(),
+            springs.ticks,
+            springs.interval_ms(),
+        )
+
+
+class WindowMotion(QObject):
+    """Fades and slides a top-level window between a resting position and an offset from it, on springs.
+
+    Opacity and position each follow the surface's spring and keep their velocity when the motion
+    turns around (a closing popup reopened mid-way), so nothing jumps or stops dead. A newly shown
+    window holds the motion until its first frame is painted, so a slow first paint cannot swallow
+    the start.
     """
 
     # True when an enter animation completed, False when an exit animation completed
     finished = pyqtSignal(bool)
 
-    def __init__(self, window: QWidget):
+    def __init__(self, window: QWidget, surface: str = "popup"):
         super().__init__(window)
         self._window = window
-        self._curve = ease_out()
-        self._clock = QElapsedTimer()
-        self._wait = QElapsedTimer()
-        self._awaiting_paint = False
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.setInterval(DEFAULT_TICK_MS)
-        self._timer.timeout.connect(self._tick)
+        self._surface = surface
+        self._springs = SpringGroup(window, 3)
+        self._springs.changed.connect(self._apply)
+        self._springs.settled.connect(self._on_settled)
         self._entering = True
-        self._duration = 0
-        self._ticks = 0
-        self._progress = 1.0
-        self._from_opacity = 1.0
-        self._to_opacity = 1.0
-        self._from_pos = QPoint()
-        self._to_pos = QPoint()
+        self._response = 0.0
+        self._awaiting_paint = False
         self._rest_pos = QPoint()
         window.installEventFilter(self)
 
@@ -158,31 +340,46 @@ class WindowMotion(QObject):
         return False
 
     def is_running(self) -> bool:
-        return self._timer.isActive()
+        return self._springs.is_running()
 
     def is_exiting(self) -> bool:
-        return self._timer.isActive() and not self._entering
+        return self.is_running() and not self._entering
 
     def enter(self, rest_pos: QPoint, offset: QPoint, duration_ms: int) -> None:
-        """Fade in while sliding from rest_pos + offset to rest_pos."""
+        """Fade in while sliding from rest_pos + offset to rest_pos. Any duration > 0 uses the spring."""
         if not animations_enabled():
             offset = QPoint(0, 0)
-        if self.is_exiting():
-            start_opacity = self._window.windowOpacity()
-            start_pos = self._window.pos()
-        else:
-            start_opacity = 0.0
-            start_pos = rest_pos + offset
         self._rest_pos = QPoint(rest_pos)
-        self._start(True, start_opacity, 1.0, start_pos, rest_pos, duration_ms)
+        self._entering = True
+        if duration_ms <= 0:
+            self._springs.jump([1.0, rest_pos.x(), rest_pos.y()])
+            self.finished.emit(True)
+            return
+        if not self.is_running():
+            start = rest_pos + offset
+            self._springs.jump([0.0, start.x(), start.y()])
+        self._response, damping = spring_params(self._surface)
+        self._springs.animate(
+            [1.0, rest_pos.x(), rest_pos.y()], self._response, damping, [0.004, 0.5, 0.5], hold=self._unpainted
+        )
 
     def exit(self, offset: QPoint, duration_ms: int) -> None:
-        """Fade out while sliding from the current position to the resting position + offset."""
+        """Fade out while sliding from where it is to the resting position + offset."""
         if not animations_enabled():
             offset = QPoint(0, 0)
         if not self.is_running():
-            self._rest_pos = self._window.pos()
-        self._start(False, self._window.windowOpacity(), 0.0, self._window.pos(), self._rest_pos + offset, duration_ms)
+            pos = self._window.pos()
+            self._rest_pos = QPoint(pos)
+            self._springs.jump([self._window.windowOpacity(), pos.x(), pos.y()])
+        self._entering = False
+        target = self._rest_pos + offset
+        if duration_ms <= 0:
+            self._springs.jump([0.0, target.x(), target.y()])
+            self.finished.emit(False)
+            return
+        # Done once it is invisible; where the position is by then no longer matters
+        self._response, damping = spring_params(self._surface, exiting=True)
+        self._springs.animate([0.0, target.x(), target.y()], self._response, damping, [0.004, math.inf, math.inf])
 
     def retarget(self, rest_pos: QPoint) -> None:
         """Move the resting position while running (the window was resized and re-anchored)."""
@@ -190,140 +387,73 @@ class WindowMotion(QObject):
             return
         delta = rest_pos - self._rest_pos
         self._rest_pos = QPoint(rest_pos)
-        self._from_pos += delta
-        self._to_pos += delta
-        self._apply(self._progress)
+        self._springs.shift([0.0, delta.x(), delta.y()])
 
     def stop(self) -> None:
         """Stop where it is, without emitting finished."""
-        self._timer.stop()
+        self._springs.stop()
 
-    def _start(
-        self, entering: bool, from_opacity: float, to_opacity: float, from_pos: QPoint, to_pos: QPoint, duration_ms: int
-    ) -> None:
-        self._timer.stop()
-        self._entering = entering
-        self._from_opacity = from_opacity
-        self._to_opacity = to_opacity
-        self._from_pos = QPoint(from_pos)
-        self._to_pos = QPoint(to_pos)
-        self._duration = max(0, int(duration_ms))
-        if self._duration == 0:
-            self._apply(1.0)
-            self.finished.emit(entering)
-            return
-        self._apply(0.0)
-        self._timer.setInterval(tick_interval_ms(self._window))
-        self._ticks = 0
-        if self._awaiting_paint:
-            # Newly shown window: _tick() starts the clock once its first frame is painted
-            self._clock.invalidate()
-            self._wait.start()
-        else:
-            self._clock.start()
-        self._timer.start()
+    def _unpainted(self) -> bool:
+        return self._awaiting_paint
 
-    def _tick(self) -> None:
-        if not self._clock.isValid():
-            if self._awaiting_paint and self._wait.elapsed() < _FIRST_PAINT_WAIT_MS:
-                return
-            self._clock.start()
-            return
-        self._ticks += 1
-        t = min(1.0, self._clock.elapsed() / self._duration)
-        self._apply(t)
-        if t >= 1.0:
-            self._timer.stop()
-            if os.path.exists(_DEBUG_FLAG):
-                logging.info(
-                    "motion %s %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
-                    "enter" if self._entering else "exit",
-                    self._duration,
-                    self._ticks,
-                    self._timer.interval(),
-                    self._clock.elapsed() / max(1, self._ticks),
-                )
-            self.finished.emit(self._entering)
-
-    def _apply(self, t: float) -> None:
-        self._progress = t
-        eased = self._curve.valueForProgress(t)
-        opacity = self._from_opacity + (self._to_opacity - self._from_opacity) * eased
-        x = round(self._from_pos.x() + (self._to_pos.x() - self._from_pos.x()) * eased)
-        y = round(self._from_pos.y() + (self._to_pos.y() - self._from_pos.y()) * eased)
-        self._window.setWindowOpacity(opacity)
+    def _apply(self) -> None:
+        opacity, x, y = self._springs.values
+        self._window.setWindowOpacity(min(1.0, max(0.0, opacity)))
+        x, y = round(x), round(y)
         if self._window.x() != x or self._window.y() != y:
             self._window.move(x, y)
 
+    def _on_settled(self) -> None:
+        _log_spring(f"motion {'enter' if self._entering else 'exit'} {self._surface}", self._response, self._springs)
+        self.finished.emit(self._entering)
+
 
 class ValueMotion(QObject):
-    """Animates one number on the shared curve and ticker, for motion that is not a whole window.
+    """One number on a surface's spring (a height, a width, a progress), on the same ticker as the windows.
 
-    start() while running continues from the current value, so retargeting never jumps.
-    With Windows "Animation effects" off it jumps straight to the end value.
+    start() while running keeps the number's position and velocity and only changes where it heads,
+    so reversing mid-way continues smoothly. With Windows "Animation effects" off it jumps.
     """
 
     valueChanged = pyqtSignal(float)
     finished = pyqtSignal()
 
-    def __init__(self, widget: QWidget, curve: QEasingCurve | None = None):
+    def __init__(self, widget: QWidget, surface: str = "section", precision: float = 0.5):
         super().__init__(widget)
-        self._widget = widget
-        self._curve = curve if curve is not None else ease_out()
-        self._clock = QElapsedTimer()
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.timeout.connect(self._tick)
-        self._from = 0.0
-        self._to = 0.0
-        self._value = 0.0
-        self._duration = 0
-        self._ticks = 0
+        self._surface = surface
+        self._precision = precision
+        self._response = 0.0
+        self._springs = SpringGroup(widget, 1)
+        self._springs.changed.connect(self._emit_value)
+        self._springs.settled.connect(self._on_settled)
 
     def value(self) -> float:
-        return self._value
+        return self._springs.values[0]
 
     def is_running(self) -> bool:
-        return self._timer.isActive()
+        return self._springs.is_running()
 
     def stop(self) -> None:
         """Stop where it is, without emitting finished."""
-        self._timer.stop()
+        self._springs.stop()
 
-    def start(self, start: float, end: float, duration_ms: int) -> None:
-        self._timer.stop()
-        self._from = float(start)
-        self._to = float(end)
-        self._duration = max(0, int(duration_ms)) if animations_enabled() else 0
-        if self._duration == 0:
-            self._set(self._to)
+    def start(self, start: float, end: float, duration_ms: int, exiting: bool = False) -> None:
+        """Head for end; from start when at rest, from where it is when running. Any duration > 0 springs."""
+        if duration_ms <= 0 or not animations_enabled():
+            self._springs.jump([end])
             self.finished.emit()
             return
-        self._set(self._from)
-        self._timer.setInterval(tick_interval_ms(self._widget))
-        self._ticks = 0
-        self._clock.start()
-        self._timer.start()
+        if not self.is_running():
+            self._springs.jump([start])
+        self._response, damping = spring_params(self._surface, exiting)
+        self._springs.animate([end], self._response, damping, [self._precision])
 
-    def _tick(self) -> None:
-        self._ticks += 1
-        t = min(1.0, self._clock.elapsed() / self._duration)
-        self._set(self._from + (self._to - self._from) * self._curve.valueForProgress(t))
-        if t >= 1.0:
-            self._timer.stop()
-            if os.path.exists(_DEBUG_FLAG):
-                logging.info(
-                    "value motion %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
-                    self._duration,
-                    self._ticks,
-                    self._timer.interval(),
-                    self._clock.elapsed() / max(1, self._ticks),
-                )
-            self.finished.emit()
+    def _emit_value(self) -> None:
+        self.valueChanged.emit(self._springs.values[0])
 
-    def _set(self, value: float) -> None:
-        self._value = value
-        self.valueChanged.emit(value)
+    def _on_settled(self) -> None:
+        _log_spring(f"value motion {self._surface}", self._response, self._springs)
+        self.finished.emit()
 
 
 class WidthReveal(QObject):
@@ -346,7 +476,7 @@ class WidthReveal(QObject):
         self._target = 0.0
         self._min_width = widget.minimumWidth()
         self._on_closed: Callable[[], None] | None = None
-        self._motion = ValueMotion(widget, ease_in_out())
+        self._motion = ValueMotion(widget, "width", precision=0.5)
         self._motion.valueChanged.connect(self._apply)
         self._motion.finished.connect(self._on_finished)
         widget.installEventFilter(self)
@@ -419,7 +549,8 @@ class WidthReveal(QObject):
             self._min_width = self._widget.minimumWidth()
         self._target = end
         self._widget.setMinimumWidth(0)
-        self._motion.start(start, end, EXPAND_MS if end > start else COLLAPSE_MS)
+        shrinking = end < start
+        self._motion.start(start, end, COLLAPSE_MS if shrinking else EXPAND_MS, exiting=shrinking)
 
     def _apply(self, width: float) -> None:
         self._width = width
@@ -552,8 +683,8 @@ class SpringMotion(QObject):
 class SnapshotGhost(QWidget):
     """A click-through copy of a window, painted at a sub-pixel offset, scale and opacity.
 
-    Its state is (opacity, scale, dx, dy). The copy is taken when the ghost is created or refreshed;
-    it only has to stand in for the real window for the ~200 ms an entrance or exit takes.
+    Its state is (opacity, scale, dx, dy), each on the popup's spring. The copy is taken when the ghost
+    is created or refreshed; it only has to stand in for the real window while it enters or leaves.
     """
 
     finished = pyqtSignal()
@@ -571,18 +702,12 @@ class SnapshotGhost(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._curve = ease_out()
-        self._clock = QElapsedTimer()
-        self._wait = QElapsedTimer()
-        self._timer = QTimer(self)
-        self._timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self._timer.timeout.connect(self._tick)
         self._painted = False
-        self._duration = 0
-        self._ticks = 0
-        self._state = (0.0, 1.0, 0.0, 0.0)
-        self._from = self._state
-        self._to = self._state
+        self._response = 0.0
+        self._springs = SpringGroup(self, 4)
+        self._springs.changed.connect(self.update)
+        self._springs.settled.connect(self._on_settled)
+        self._springs.jump([0.0, 1.0, 0.0, 0.0])
         self._origin = QPointF(origin)
         self.refresh(window)
 
@@ -598,62 +723,33 @@ class SnapshotGhost(QWidget):
         self._origin = QPointF(origin)
 
     def state(self) -> tuple[float, float, float, float]:
-        return self._state
+        return tuple(self._springs.values)
 
     def is_running(self) -> bool:
-        return self._timer.isActive()
+        return self._springs.is_running()
 
     def stop(self) -> None:
-        self._timer.stop()
+        self._springs.stop()
 
     def jump(self, state: tuple[float, float, float, float]) -> None:
-        self._timer.stop()
-        self._state = state
-        self.update()
+        self._springs.jump(state)
 
-    def animate(self, to_state: tuple[float, float, float, float], duration_ms: int) -> None:
-        """Move from the current state to to_state on the shared curve; emits finished at the end."""
-        self._timer.stop()
-        self._from = self._state
-        self._to = to_state
-        self._duration = max(0, int(duration_ms))
-        if self._duration == 0:
-            self.jump(to_state)
-            self.finished.emit()
-            return
-        self._timer.setInterval(tick_interval_ms(self))
-        self._ticks = 0
-        self._clock.invalidate()
-        self._wait.start()
-        self._timer.start()
+    def animate(self, to_state, response: float, damping: float, precisions) -> None:
+        """Head for to_state on the spring, from the current state and velocity; emits finished when settled."""
+        self._response = response
+        self._springs.animate(to_state, response, damping, precisions, hold=self._unpainted)
 
-    def _tick(self) -> None:
-        if not self._clock.isValid():
-            # A new window needs its first paint before the clock starts, or the start is skipped
-            if not self._painted and self._wait.elapsed() < _FIRST_PAINT_WAIT_MS:
-                return
-            self._clock.start()
-            return
-        self._ticks += 1
-        t = min(1.0, self._clock.elapsed() / self._duration)
-        eased = self._curve.valueForProgress(t)
-        self._state = tuple(a + (b - a) * eased for a, b in zip(self._from, self._to))
-        self.update()
-        if t >= 1.0:
-            self._timer.stop()
-            if os.path.exists(_DEBUG_FLAG):
-                logging.info(
-                    "snapshot motion %d ms: %d ticks at %d ms interval, avg %.1f ms per tick",
-                    self._duration,
-                    self._ticks,
-                    self._timer.interval(),
-                    self._clock.elapsed() / max(1, self._ticks),
-                )
-            self.finished.emit()
+    def _unpainted(self) -> bool:
+        return not self._painted
+
+    def _on_settled(self) -> None:
+        _log_spring("snapshot motion", self._response, self._springs)
+        self.finished.emit()
 
     def paintEvent(self, event) -> None:
         self._painted = True
-        opacity, scale, dx, dy = self._state
+        opacity, scale, dx, dy = self._springs.values
+        opacity = min(1.0, opacity)
         if opacity <= 0.0 or self._pixmap.isNull():
             return
         margin = float(SNAPSHOT_MARGIN_PX)
@@ -682,10 +778,11 @@ class SnapshotMotion(QObject):
     # True when an enter animation completed, False when an exit animation completed
     finished = pyqtSignal(bool)
 
-    def __init__(self, window: QWidget, origin: Callable[[], QPointF]):
+    def __init__(self, window: QWidget, origin: Callable[[], QPointF], surface: str = "popup"):
         super().__init__(window)
         self._window = window
         self._origin = origin
+        self._surface = surface
         self._ghost: SnapshotGhost | None = None
         self._entering = True
 
@@ -718,7 +815,9 @@ class SnapshotMotion(QObject):
             ghost.refresh(self._window)
         self._window.setWindowOpacity(0.0)
         ghost.show()
-        ghost.animate((1.0, 1.0, 0.0, 0.0), duration_ms)
+        response, damping = spring_params(self._surface)
+        # The hand-over needs the copy exactly on the window's pixels, so it settles to a twentieth of one
+        ghost.animate((1.0, 1.0, 0.0, 0.0), response, damping, [0.004, 0.0005, 0.05, 0.05])
 
     def exit(self, offset: QPoint, duration_ms: int) -> None:
         """Fade out, drift by offset and shrink a hair; the owner hides the real window afterwards."""
@@ -740,7 +839,9 @@ class SnapshotMotion(QObject):
         # the widget that opened it), but only the copy is visible
         self._window.setWindowOpacity(0.0)
         ghost.show()
-        ghost.animate((0.0, scale, float(offset.x()), float(offset.y())), duration_ms)
+        response, damping = spring_params(self._surface, exiting=True)
+        # Done once the copy is invisible; its scale and offset by then no longer matter
+        ghost.animate((0.0, scale, float(offset.x()), float(offset.y())), response, damping, [0.004, math.inf, math.inf, math.inf])
 
     def retarget(self, rest_pos: QPoint) -> None:
         """The window was resized or re-anchored mid-animation: copy it again where it is now."""

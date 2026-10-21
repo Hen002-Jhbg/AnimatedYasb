@@ -152,7 +152,7 @@ class AnimatedContextMenu(QMenu):
         super().__init__(parent)
 
         self._is_closing = False
-        self._motion = WindowMotion(self)
+        self._motion = WindowMotion(self, "menu")
         self._motion.finished.connect(self._on_motion_finished)
 
     def _slide_offset(self, distance: int = SLIDE_PX) -> QPoint:

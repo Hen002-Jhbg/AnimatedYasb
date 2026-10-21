@@ -193,8 +193,9 @@ class VolumeWidget(BaseWidget):
 
         refresh_widget_style(self.app_toggle_btn)
 
-        # Shared strong ease-out at the screen refresh rate; opening takes a little longer than closing
-        motion.start(current_height, target_height, EXPAND_MS if self.app_volumes_expanded else COLLAPSE_MS)
+        # The section spring; closing is the quicker one, and toggling mid-way keeps the list's speed
+        expanding = self.app_volumes_expanded
+        motion.start(current_height, target_height, EXPAND_MS if expanding else COLLAPSE_MS, exiting=not expanding)
 
     def _on_app_volumes_height(self, value: float):
         """Grow or shrink the app list and fit the popup around it, one frame at a time."""

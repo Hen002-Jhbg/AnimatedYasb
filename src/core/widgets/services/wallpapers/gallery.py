@@ -158,7 +158,7 @@ class GalleryWindow(QMainWindow):
         self.initUI(parent, screen)
         # Same fade as the popups: shared curve and ticker, from the current opacity, clock started at the
         # first paint. The gallery is centred like a dialog, so it fades in place.
-        self._motion = WindowMotion(self)
+        self._motion = WindowMotion(self, "gallery")
         self._motion.finished.connect(self._on_motion_finished)
         self.setWindowOpacity(0.0)
         self.show()

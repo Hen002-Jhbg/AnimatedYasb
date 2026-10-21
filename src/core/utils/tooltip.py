@@ -42,7 +42,7 @@ class CustomToolTip(QFrame):
         self.apply_stylesheet()
 
         # Same window fade + slide as the bar popups, at tooltip size and speed
-        self._motion = WindowMotion(self)
+        self._motion = WindowMotion(self, "tooltip")
         self._motion.finished.connect(self._on_motion_finished)
 
         self.hide_timer = QTimer(self)
