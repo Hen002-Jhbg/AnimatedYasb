@@ -27,7 +27,7 @@ import os
 import winreg
 from ctypes import wintypes
 
-from PyQt6.QtCore import QEasingCurve, QPointF, QRectF, Qt, QThread, QTimeLine, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimeLine, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QImage, QPainter, QPainterPath, QPixmap, QPolygonF
 from PyQt6.QtWidgets import QApplication, QWidget
 from win32con import (
@@ -41,7 +41,7 @@ from win32con import (
     WS_POPUP,
 )
 
-from core.utils.motion import tick_interval_ms
+from core.utils.motion import ease_in_out, tick_interval_ms
 
 logger = logging.getLogger("wallpaper_engine")
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -454,7 +454,8 @@ class WallpaperEngine(QWidget):
         # One update per frame of the screen (4 ms at 165 Hz) instead of a fixed 16 ms; a full-screen
         # frame paints in well under 1 ms, so the reveal edge no longer steps across the screen
         self._timeline.setUpdateInterval(tick_interval_ms(self))
-        self._timeline.setEasingCurve(QEasingCurve.Type.OutQuad)
+        # The reveal sweeps across the whole screen: strong ease-in-out, cubic-bezier(0.77, 0, 0.175, 1)
+        self._timeline.setEasingCurve(ease_in_out())
         self._timeline.valueChanged.connect(self._on_progress)
         self._timeline.finished.connect(self._on_finished)
 
