@@ -10,6 +10,7 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from core.events.service import EventService
+from core.utils.motion import HoverPillFrame
 from core.utils.win32.system_function import function_map
 from core.widgets.registry import register_widget_class
 
@@ -27,7 +28,8 @@ class BaseWidget(QWidget):
 
     def __init__(self, timer_interval: int = None, class_name: str = ""):
         super().__init__()
-        self._widget_frame = QFrame()
+        # Paints its own hover/press pill when the stylesheet gives it colours (see HoverPillFrame)
+        self._widget_frame = HoverPillFrame()
         self._widget_frame_layout = QHBoxLayout()
         self.widget_layout = QHBoxLayout()
         self.timer_interval = timer_interval
@@ -74,6 +76,7 @@ class BaseWidget(QWidget):
 
     def clear_hover_state(self):
         """Clear stuck :hover CSS state after opening a popup."""
+        self._widget_frame.release_hover()
         for w in [self, self._widget_frame, *self._widget_frame.findChildren(QWidget)]:
             w.setAttribute(Qt.WidgetAttribute.WA_UnderMouse, False)
             w.style().unpolish(w)
