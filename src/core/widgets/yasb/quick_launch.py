@@ -587,8 +587,9 @@ class QuickLaunchWidget(BaseWidget):
             round_corners_type=cfg.round_corners_type,
             border_color=cfg.border_color,
             dark_mode=cfg.dark_mode,
-            # Opened from a keyboard shortcut many times a day: appear and disappear instantly
-            animated=False,
+            # Summoned from the keyboard: grows from its centre on a quick spring, shows typing at once,
+            # and gives the keyboard back the moment it starts to close
+            launcher=True,
         )
         popup.setProperty("class", "quick-launch-popup")
         popup._popup_content.setProperty("class", "container")

@@ -60,6 +60,9 @@ TOOLTIP_WARM_MS = 300
 # Snapshot popups also grow slightly from the side facing the bar, and shrink a hair on the way out
 ENTER_SCALE = 0.97
 EXIT_SCALE = 0.99
+# A launcher (Quick Launch) does not slide, so it grows a little more, from its own centre
+LAUNCHER_ENTER_SCALE = 0.96
+LAUNCHER_EXIT_SCALE = 0.98
 # Room around the snapshot so the slide never clips it, in pixels
 SNAPSHOT_MARGIN_PX = 12
 
@@ -135,6 +138,8 @@ SPRINGS = {
     "section": (0.32, 0.24, 1.0),
     # Bar widgets' hover pill: a quick fade in, a slightly longer fade out
     "hover": (0.10, 0.16, 1.0),
+    # Quick Launch, summoned from the keyboard many times a day: quicker than a popup both ways
+    "launcher": (0.24, 0.15, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
@@ -919,13 +924,48 @@ class SnapshotMotion(QObject):
     # True when an enter animation completed, False when an exit animation completed
     finished = pyqtSignal(bool)
 
-    def __init__(self, window: QWidget, origin: Callable[[], QPointF], surface: str = "popup"):
+    def __init__(
+        self,
+        window: QWidget,
+        origin: Callable[[], QPointF],
+        surface: str = "popup",
+        scales: tuple[float, float] = (ENTER_SCALE, EXIT_SCALE),
+        live: bool = False,
+        release_on_exit: bool = False,
+    ):
+        """live: the copy follows the window's repaints while it enters (typing shows at once).
+        release_on_exit: the window hides as the exit starts, so the keyboard and mouse go back to
+        whatever is underneath right away, and only the copy fades.
+        """
         super().__init__(window)
         self._window = window
         self._origin = origin
         self._surface = surface
+        self._enter_scale, self._exit_scale = scales
+        self._live = live
+        self._release_on_exit = release_on_exit
+        self._refresh_pending = False
         self._ghost: SnapshotGhost | None = None
         self._entering = True
+        if live:
+            window.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        # The window repaints after an UpdateRequest; copy it again once that has happened
+        if obj is self._window and event.type() == QEvent.Type.UpdateRequest and self._ghost is not None:
+            if not self._refresh_pending:
+                self._refresh_pending = True
+                QTimer.singleShot(0, self._refresh_live)
+        return False
+
+    def _refresh_live(self) -> None:
+        self._refresh_pending = False
+        if self._ghost is not None and self._entering and self._window.isVisible():
+            self._ghost.set_origin(self._origin())
+            self._ghost.refresh(self._window)
+
+    def releases_on_exit(self) -> bool:
+        return self._release_on_exit
 
     def is_running(self) -> bool:
         return self._ghost is not None and self._ghost.is_running()
@@ -942,7 +982,7 @@ class SnapshotMotion(QObject):
             self._window.setWindowOpacity(1.0)
             self.finished.emit(True)
             return
-        scale = ENTER_SCALE
+        scale = self._enter_scale
         if not animations_enabled():
             offset, scale = QPoint(0, 0), 1.0
         self._entering = True
@@ -966,7 +1006,7 @@ class SnapshotMotion(QObject):
             self._drop_ghost()
             self.finished.emit(False)
             return
-        scale = EXIT_SCALE
+        scale = self._exit_scale
         if not animations_enabled():
             offset, scale = QPoint(0, 0), 1.0
         self._entering = False
@@ -976,10 +1016,14 @@ class SnapshotMotion(QObject):
             ghost.jump((self._window.windowOpacity(), 1.0, 0.0, 0.0))
         else:
             ghost.refresh(self._window)
-        # The real window stays shown so it keeps the mouse grab (the closing click must not reach
-        # the widget that opened it), but only the copy is visible
-        self._window.setWindowOpacity(0.0)
         ghost.show()
+        if self._release_on_exit:
+            # Give the keyboard and mouse back at once; only the copy is left to fade
+            self._window.setVisible(False)
+        else:
+            # The real window stays shown so it keeps the mouse grab (the closing click must not reach
+            # the widget that opened it), but only the copy is visible
+            self._window.setWindowOpacity(0.0)
         response, damping = spring_params(self._surface, exiting=True)
         # Done once the copy is invisible; its scale and offset by then no longer matter
         ghost.animate((0.0, scale, float(offset.x()), float(offset.y())), response, damping, [0.004, math.inf, math.inf, math.inf])

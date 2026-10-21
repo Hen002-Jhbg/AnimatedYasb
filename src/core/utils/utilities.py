@@ -42,6 +42,8 @@ from winrt.windows.ui.notifications import ToastNotification, ToastNotificationM
 
 from core.utils.motion import (
     EXIT_SLIDE_PX,
+    LAUNCHER_ENTER_SCALE,
+    LAUNCHER_EXIT_SCALE,
     MENU_ENTER_MS,
     MENU_EXIT_MS,
     POPUP_ENTER_MS,
@@ -270,6 +272,7 @@ class PopupWidget(QWidget):
         persistent: bool = False,
         pinnable: bool = False,
         animated: bool = True,
+        launcher: bool = False,
     ):
         super().__init__(parent)
 
@@ -301,8 +304,24 @@ class PopupWidget(QWidget):
         # A copy of the window plays the fade, slide and slight growth at sub-pixel precision while the
         # window itself stays put (a window can only move by whole pixels). Blurred popups keep moving
         # the real window, because a snapshot cannot carry DWM's live blur.
+        # A launcher (Quick Launch) is summoned from the keyboard and sits mid-screen: it grows from its own
+        # centre instead of sliding from the bar, its copy follows typing while it enters, and it lets go of
+        # the keyboard and mouse as soon as it starts closing.
         self._animated = animated
-        self._motion = WindowMotion(self) if blur else SnapshotMotion(self, self._scale_origin)
+        self._launcher = launcher
+        if blur:
+            self._motion = WindowMotion(self, "launcher" if launcher else "popup")
+        elif launcher:
+            self._motion = SnapshotMotion(
+                self,
+                self._scale_origin,
+                "launcher",
+                (LAUNCHER_ENTER_SCALE, LAUNCHER_EXIT_SCALE),
+                live=True,
+                release_on_exit=True,
+            )
+        else:
+            self._motion = SnapshotMotion(self, self._scale_origin)
         self._motion.finished.connect(self._on_motion_finished)
 
         self._is_closing = False
@@ -442,12 +461,16 @@ class PopupWidget(QWidget):
 
     def _slide_offset(self, distance: int = SLIDE_PX) -> QPoint:
         """Offset toward the bar: popups that open downward slide down into place, upward ones slide up."""
+        if self._launcher:
+            return QPoint(0, 0)
         pos_args = getattr(self, "_pos_args", None)
         direction = pos_args[1] if pos_args else "down"
         return QPoint(0, distance if direction == "up" else -distance)
 
     def _scale_origin(self) -> QPointF:
         """Where the popup grows from: its edge facing the bar, under the middle of its trigger."""
+        if self._launcher:
+            return QPointF(self.width() / 2.0, self.height() / 2.0)
         pos_args = getattr(self, "_pos_args", None)
         up = bool(pos_args) and pos_args[1] == "up"
         x = self.width() / 2.0
@@ -535,6 +558,9 @@ class PopupWidget(QWidget):
                 PopupWidget._open_popups.pop(parent_id, None)
 
         self._is_closing = False
+        if self.isVisible():
+            # Turning a fade-out around: hide_animated() removed the outside-click filter
+            QApplication.instance().installEventFilter(self)
         # Start invisible so the first frame is never drawn at full opacity
         self.setWindowOpacity(0.0)
         super().show()
@@ -612,7 +638,11 @@ class PopupWidget(QWidget):
             # active window, which the bar never is. Without a press the release reaches nobody, so switching
             # popups used to take two clicks. Qt must not replay it a second time.
             self.setAttribute(Qt.WidgetAttribute.WA_NoMouseReplay)
-            self.hide()
+            if isinstance(self._motion, SnapshotMotion) and self._motion.releases_on_exit() and self._animated:
+                # This one lets go of the mouse as its fade starts, so it can fade and still hand the press on
+                self.hide_animated()
+            else:
+                self.hide()
             self._replay_press(event)
             return True
         return super().eventFilter(obj, event)
