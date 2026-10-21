@@ -6,7 +6,8 @@ contains moves with it and nothing is resized or re-laid out while it runs. Valu
 a single number (a scroll offset, a height) on the same curve and ticker. SpringMotion moves a
 number on a critically damped spring for motion that is retargeted often, like a carousel.
 SnapshotMotion plays a popup's entrance and exit on a copy of it drawn at sub-pixel position and
-scale, because a real window can only sit on whole pixels.
+scale, because a real window can only sit on whole pixels. WidthReveal opens and closes a bar
+widget by its width, so the widgets next to it slide instead of jumping.
 """
 
 import ctypes
@@ -56,6 +57,9 @@ EXIT_SCALE = 0.99
 # Room around the snapshot so the slide never clips it, in pixels
 SNAPSHOT_MARGIN_PX = 12
 
+# Qt's "no limit" for a widget's size (QWIDGETSIZE_MAX)
+_NO_SIZE_LIMIT = 16777215
+
 # Qt's own animation timer ticks every 16 ms
 DEFAULT_TICK_MS = 16
 
@@ -85,6 +89,13 @@ def ease_out() -> QEasingCurve:
     """Strong ease-out: cubic-bezier(0.23, 1, 0.32, 1)."""
     curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
     curve.addCubicBezierSegment(QPointF(0.23, 1.0), QPointF(0.32, 1.0), QPointF(1.0, 1.0))
+    return curve
+
+
+def ease_in_out() -> QEasingCurve:
+    """Strong ease-in-out: cubic-bezier(0.77, 0, 0.175, 1), for things moving across the screen."""
+    curve = QEasingCurve(QEasingCurve.Type.BezierSpline)
+    curve.addCubicBezierSegment(QPointF(0.77, 0.0), QPointF(0.175, 1.0), QPointF(1.0, 1.0))
     return curve
 
 
@@ -313,6 +324,90 @@ class ValueMotion(QObject):
     def _set(self, value: float) -> None:
         self._value = value
         self.valueChanged.emit(value)
+
+
+class WidthReveal(QObject):
+    """Opens and closes a bar widget by its width, so the widgets next to it slide instead of jumping.
+
+    Opening shows the widget at zero width and grows it to its natural width, following it if the
+    content changes meanwhile, then lifts the limit. Closing shrinks it to zero and then hides it;
+    with hide_when_closed=False it stays shown at zero width instead (the audio visualizer must keep
+    getting show and hide events). Reversing mid-way continues from the current width. A widget that
+    is not on screen opens or closes at once, and so does everything with Windows "Animation effects" off.
+    """
+
+    def __init__(self, widget: QWidget, is_open: bool = True, hide_when_closed: bool = True):
+        super().__init__(widget)
+        self._widget = widget
+        self._open = is_open
+        self._hide_when_closed = hide_when_closed
+        self._progress = 1.0 if is_open else 0.0
+        self._min_width = widget.minimumWidth()
+        self._motion = ValueMotion(widget, ease_in_out())
+        self._motion.valueChanged.connect(self._apply)
+        self._motion.finished.connect(self._on_finished)
+
+    def is_open(self) -> bool:
+        return self._open
+
+    def open(self) -> None:
+        """Grow to the natural width, showing the widget first."""
+        if self._open:
+            return
+        self._open = True
+        start = self._progress if self._motion.is_running() else 0.0
+        if not self._motion.is_running():
+            self._min_width = self._widget.minimumWidth()
+        self._widget.setMinimumWidth(0)
+        if self._hide_when_closed and self._widget.isHidden():
+            self._widget.setMaximumWidth(0)
+            self._widget.show()
+        self._motion.start(start, 1.0, round(EXPAND_MS * (1.0 - start)))
+
+    def close(self) -> None:
+        """Shrink to zero width, then hide (unless the widget has to stay shown)."""
+        if not self._open:
+            return
+        if not self._widget.isVisible():
+            self.set_open(False)
+            return
+        self._open = False
+        start = self._progress if self._motion.is_running() else 1.0
+        if not self._motion.is_running():
+            self._min_width = self._widget.minimumWidth()
+        self._widget.setMinimumWidth(0)
+        self._motion.start(start, 0.0, round(COLLAPSE_MS * start))
+
+    def set_open(self, is_open: bool) -> None:
+        """Jump to open or closed without animating (startup, or a widget that is not on screen)."""
+        self._motion.stop()
+        self._open = is_open
+        self._progress = 1.0 if is_open else 0.0
+        self._finish()
+
+    def _apply(self, progress: float) -> None:
+        self._progress = progress
+        width = max(0, round(progress * self._widget.sizeHint().width()))
+        if self._widget.maximumWidth() != width:
+            self._widget.setMaximumWidth(width)
+
+    def _on_finished(self) -> None:
+        self._finish()
+
+    def _finish(self) -> None:
+        if self._open:
+            self._widget.setMaximumWidth(_NO_SIZE_LIMIT)
+            self._widget.setMinimumWidth(self._min_width)
+            if self._hide_when_closed and self._widget.isHidden():
+                self._widget.show()
+        elif self._hide_when_closed:
+            self._widget.hide()
+            self._widget.setMaximumWidth(_NO_SIZE_LIMIT)
+            self._widget.setMinimumWidth(self._min_width)
+        else:
+            self._widget.setMinimumWidth(0)
+            self._widget.setMaximumWidth(0)
+        self._widget.updateGeometry()
 
 
 class SpringMotion(QObject):

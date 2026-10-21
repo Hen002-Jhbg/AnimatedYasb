@@ -2,9 +2,10 @@
 
 import time
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QHideEvent, QShowEvent
 
+from core.utils.motion import WidthReveal
 from core.validation.widgets.yasb.audio_visualizer import AudioVisualizerConfig
 from core.widgets.base import BaseWidget
 from core.widgets.services.audio_visualizer.loopback import AudioVisualizerCaptureService
@@ -134,9 +135,8 @@ class AudioVisualizerWidget(BaseWidget):
         self._widget_container_layout.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter)
         self._widget_container_layout.addWidget(self._canvas)
 
-        self._collapse_animation = QPropertyAnimation(self, b"maximumWidth", self)
-        self._collapse_animation.setDuration(150)
-        self._collapse_animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        # Opening and closing slide the clock and the media widget along, on the shared motion ticker
+        self._reveal = WidthReveal(self, hide_when_closed=False)
 
         self.callback_left = config.callbacks.on_left
         self.callback_middle = config.callbacks.on_middle
@@ -184,19 +184,12 @@ class AudioVisualizerWidget(BaseWidget):
         forever. A zero-width widget stays visually gone but still gets the
         bar's show/hide events, so ``hideEvent`` can always release the stream.
         """
-        target = 0 if collapsed else self.sizeHint().width()
         if not animate:
-            self._collapse_animation.stop()
-            self.setMinimumWidth(0)
-            self.setMaximumWidth(target)
-            self.updateGeometry()
-            return
-        current = self.width()
-        self._collapse_animation.stop()
-        self.setMinimumWidth(0)
-        self._collapse_animation.setStartValue(current)
-        self._collapse_animation.setEndValue(target)
-        self._collapse_animation.start()
+            self._reveal.set_open(not collapsed)
+        elif collapsed:
+            self._reveal.close()
+        else:
+            self._reveal.open()
 
     @staticmethod
     def _resolve_style_metrics(config: AudioVisualizerConfig) -> tuple[int, int, int, int]:

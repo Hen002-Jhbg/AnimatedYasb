@@ -5,6 +5,7 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QLabel
 
 from core.events.service import EventService
+from core.utils.motion import WidthReveal
 from core.utils.system import is_windows_10
 from core.utils.utilities import refresh_widget_style
 from core.utils.win32.system_function import notification_center, quick_settings
@@ -31,6 +32,8 @@ class NotificationsWidget(BaseWidget):
 
         self._init_container()
         self.build_widget_label(self.config.label, self.config.label_alt)
+        # Appearing and disappearing by width, so the widgets next to it slide instead of jumping
+        self._reveal = WidthReveal(self)
 
         self.callback_left = self.config.callbacks.on_left
         self.callback_right = self.config.callbacks.on_right
@@ -50,9 +53,9 @@ class NotificationsWidget(BaseWidget):
     def _on_windows_notification_update(self, total_notifications: int):
         self._notification_count = total_notifications
         if total_notifications > 0:
-            self.setVisible(True)
+            self._reveal.open()
         elif self.config.hide_empty:
-            self.setVisible(False)
+            self._reveal.close()
         self._update_label()
 
     def _toggle_notification(self):
@@ -75,7 +78,7 @@ class NotificationsWidget(BaseWidget):
 
     def _update_label(self):
         if self._notification_count == 0 and self.config.hide_empty:
-            self.setVisible(False)
+            self._reveal.close()
             return
 
         active_widgets = self._widgets_alt if self._show_alt_label else self._widgets

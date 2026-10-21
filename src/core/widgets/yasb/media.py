@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 from qasync import asyncSlot  # type: ignore
 
+from core.utils.motion import WidthReveal
 from core.utils.utilities import (
     PopupWidget,
     ScrollingLabel,
@@ -84,6 +85,8 @@ class MediaWidget(BaseWidget):
         self._init_container()
         if self.config.hide_empty:
             self.hide()
+        # With hide_empty the widget opens and closes by its width, so the clock slides instead of jumping
+        self._reveal = WidthReveal(self, is_open=not self.config.hide_empty)
 
         # Get media manager
         self.media = WindowsMedia()
@@ -631,7 +634,7 @@ class MediaWidget(BaseWidget):
 
         if self.current_session is not None:
             # If media is not None, we show the frame
-            self.show()
+            self._reveal.open()
 
             # If we do not only have controls, make sure the label is shown
             if not self.config.controls_only:
@@ -658,7 +661,7 @@ class MediaWidget(BaseWidget):
 
             # If we want to hide the widget when no music is playing, hide it!
             if self.config.hide_empty:
-                self.hide()
+                self._reveal.close()
 
     def _on_playback_info_changed(self):
         if self.current_session is None or not self.current_session.playback_ready:
