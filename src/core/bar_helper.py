@@ -3,6 +3,7 @@ import logging
 import os
 import subprocess
 import winreg
+from collections.abc import Callable
 from datetime import datetime
 from functools import partial
 from typing import Any
@@ -18,6 +19,7 @@ from PyQt6.QtCore import (
     QRect,
     Qt,
     QTimer,
+    pyqtSignal,
 )
 from PyQt6.QtGui import QCursor
 from PyQt6.QtWidgets import (
@@ -84,6 +86,9 @@ class BarAnimationManager(QObject):
     Showing while a hide is running (or the other way round) turns around from where the bar is, at the
     speed it has, instead of waiting for the end. Hiding is the system answering, so its spring is quicker.
     """
+
+    # True once the bar has finished showing, False once it has finished hiding
+    finished = pyqtSignal(bool)
 
     def __init__(self, bar_widget: QWidget, parent=None):
         super().__init__(parent)
@@ -189,11 +194,19 @@ class BarAnimationManager(QObject):
         else:
             self.bar_widget.setWindowOpacity(value)
 
+    def is_running(self) -> bool:
+        return self._is_running()
+
+    def is_hiding(self) -> bool:
+        """Still on screen, sliding or fading out."""
+        return self._is_running() and not self._showing
+
     def _on_finished(self):
         if self._showing:
             self._on_show_finished()
         else:
             self._on_hide_finished()
+        self.finished.emit(self._showing)
 
     def _on_show_finished(self):
         if self._target_geo:
@@ -1114,11 +1127,21 @@ class AutoWidthManager(QObject):
 
 
 class BarCliManager(QObject):
-    """Handles CLI show/hide/toggle commands for a bar, including app bar reservation management."""
+    """Handles CLI show/hide/toggle commands for a bar, including app bar reservation management.
+
+    Registering or removing the app bar reservation blocks the UI thread while Windows moves the other
+    windows (about half a second), which froze the bar mid-slide. So the reservation waits for the
+    animation: the space is reserved once the bar is in place and given back once it is gone. A show
+    that arrives while the bar is still sliding out turns it around, and a toggle goes by where the bar
+    is heading, not only by whether it is still visible.
+    """
 
     def __init__(self, bar_widget: QWidget, parent=None):
         super().__init__(parent)
         self.bar_widget = bar_widget
+        # The state the bar must end in, and the reservation change to make then
+        self._pending: tuple[bool, Callable[[], None]] | None = None
+        self._listening = False
 
     def handle(self, action: str, screen_name: str) -> None:
         current_screen_matches = not screen_name or self.bar_widget._target_screen.name() == screen_name
@@ -1128,20 +1151,48 @@ class BarCliManager(QObject):
         autohide_active = self.bar_widget._autohide_manager and self.bar_widget._autohide_manager.is_enabled()
         manages_app_bar = self.bar_widget._window_flags["windows_app_bar"] and not autohide_active
 
+        if action == "toggle":
+            action = "hide" if self._is_shown() else "show"
         if action == "show":
-            self.bar_widget.show()
-            if manages_app_bar:
-                SystrayAppBarHelper.execute_without_systray_interference(self.bar_widget.update_app_bar)
+            self._show(manages_app_bar)
         elif action == "hide":
-            if manages_app_bar:
-                SystrayAppBarHelper.execute_without_systray_interference(self.bar_widget.try_remove_app_bar)
             self.bar_widget.hide()
-        elif action == "toggle":
-            if self.bar_widget.isVisible():
-                if manages_app_bar:
-                    SystrayAppBarHelper.execute_without_systray_interference(self.bar_widget.try_remove_app_bar)
-                self.bar_widget.hide()
-            else:
-                self.bar_widget.show()
-                if manages_app_bar:
-                    SystrayAppBarHelper.execute_without_systray_interference(self.bar_widget.update_app_bar)
+            if manages_app_bar:
+                self._after_motion(False, self.bar_widget.try_remove_app_bar)
+
+    def _manager(self):
+        return getattr(self.bar_widget, "_animation_manager", None)
+
+    def _is_shown(self) -> bool:
+        """Visible and not on its way out."""
+        manager = self._manager()
+        return self.bar_widget.isVisible() and not (manager is not None and manager.is_hiding())
+
+    def _show(self, manages_app_bar: bool) -> None:
+        manager = self._manager()
+        if self.bar_widget.isVisible() and manager is not None and manager.is_hiding():
+            # Still sliding out: turn it around from where it is. Its reservation was never given back.
+            self._pending = None
+            self.bar_widget.show_bar()
+            return
+        self.bar_widget.show()
+        if manages_app_bar:
+            self._after_motion(True, self.bar_widget.update_app_bar)
+
+    def _after_motion(self, shown: bool, change: Callable[[], None]) -> None:
+        """Make a reservation change once the bar has finished showing (True) or hiding (False)."""
+        manager = self._manager()
+        if manager is None or not manager.is_running():
+            self._pending = None
+            SystrayAppBarHelper.execute_without_systray_interference(change)
+            return
+        if not self._listening:
+            manager.finished.connect(self._on_motion_finished)
+            self._listening = True
+        self._pending = (shown, change)
+
+    def _on_motion_finished(self, shown: bool) -> None:
+        pending, self._pending = self._pending, None
+        # A motion that turned around ends in the other state; its change no longer applies
+        if pending is not None and pending[0] == shown:
+            SystrayAppBarHelper.execute_without_systray_interference(pending[1])
