@@ -1200,8 +1200,24 @@ class BarCliManager(QObject):
             self.bar_widget.show_bar()
             return
         self.bar_widget.show()
+        self._raise_above_windows()
         if manages_app_bar:
             self._after_motion(True, self.bar_widget.update_app_bar)
+
+    def _raise_above_windows(self) -> None:
+        """Put the bar at the top of the normal windows without taking the focus.
+
+        While it was hidden its strip was free, so maximized windows grew into it, and a window clicked in
+        the meantime sits above the bar: the whole show would play underneath, until the reservation pushed
+        them down at the end. Topmost, then not-topmost, lands it on top of the normal windows. A bar that is
+        always on top already is left alone.
+        """
+        if self.bar_widget._window_flags.get("always_on_top"):
+            return
+        hwnd = int(self.bar_widget.winId())
+        flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags)
+        SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags)
 
     def _after_motion(self, shown: bool, change: Callable[[], None]) -> None:
         """Make a reservation change once the bar has finished showing (True) or hiding (False)."""
