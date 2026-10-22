@@ -113,6 +113,7 @@ class SystrayPopup(QWidget):
         self._is_closing = False
         self._motion.enter(self.pos(), self._slide_offset(), POPUP_ENTER_MS)
         self._toggle_btn.setChecked(True)
+        self._set_owner_active(True)
         self._toggle_btn.setText(label_expanded)
 
     def relayout_grid(self):
@@ -210,6 +211,7 @@ class SystrayPopup(QWidget):
         self._toggle_btn.setChecked(False)
         if self._label_collapsed:
             self._toggle_btn.setText(self._label_collapsed)
+        self._set_owner_active(False)
 
         self._is_closing = True
         self._motion.exit(self._slide_offset(EXIT_SLIDE_PX), POPUP_EXIT_MS)
@@ -227,8 +229,15 @@ class SystrayPopup(QWidget):
     def hideEvent(self, event):
         self._watch_timer.stop()
         self._motion.stop()
+        self._set_owner_active(False)
         super().hideEvent(event)
         self.closed.emit()
+
+    def _set_owner_active(self, active: bool) -> None:
+        """Hold the systray widget's pill while this popup is open (see HoverPillFrame.set_active)."""
+        owner = self.parentWidget()
+        if owner is not None and hasattr(owner, "set_popup_active"):
+            owner.set_popup_active(active)
 
     def closeEvent(self, event):
         event.ignore()

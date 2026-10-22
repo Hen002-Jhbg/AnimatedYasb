@@ -34,8 +34,8 @@ from PyQt6.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QPainter
-from PyQt6.QtWidgets import QFrame, QWidget
+from PyQt6.QtGui import QColor, QCursor, QPainter
+from PyQt6.QtWidgets import QApplication, QFrame, QWidget
 
 POPUP_ENTER_MS = 200
 POPUP_EXIT_MS = 150
@@ -608,18 +608,29 @@ class HoverPillFrame(QFrame):
     paints nothing. A frame of it costs about a fifth of restyling the widget, which is what a CSS
     :hover transition does on every frame (0.28 ms against 1.27 ms on the bar), so it can afford to
     run at the screen's rate instead of the transition engine's 60 Hz.
+
+    While a popup holds the mouse (a Qt.Popup grabs it), the bar gets no Enter or Leave, so the popup
+    lights the pill under the pointer by proxy (hover_by_proxy_at) and the pill follows the pointer
+    itself until Qt reports it again. While the widget's own popup is open, its pill holds the active
+    colour (activecolor, else presscolor, else hovercolor), like a menu title in a menu bar.
     """
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._hover_color = QColor(0, 0, 0, 0)
         self._press_color = QColor(0, 0, 0, 0)
+        self._active_color = QColor(0, 0, 0, 0)
         self._pill_radius = 10
         self._inset_x = 2
         self._inset_y = 3
         self._hovered = False
         self._pressed = False
+        self._active = False
         self._response = 0.0
+        # While hovered by proxy, check every frame whether the pointer is still on the widget
+        self._proxy_timer = QTimer(self)
+        self._proxy_timer.setInterval(16)
+        self._proxy_timer.timeout.connect(self._follow_pointer)
         # The pill's colour, channel by channel (r, g, b, a)
         self._color = SpringGroup(self, 4)
         self._color.changed.connect(self.update)
@@ -639,6 +650,14 @@ class HoverPillFrame(QFrame):
     def _set_press_color(self, color: QColor) -> None:
         if QColor(color) != self._press_color:
             self._press_color = QColor(color)
+            self._retarget(instant=True)
+
+    def _get_active_color(self) -> QColor:
+        return self._active_color
+
+    def _set_active_color(self, color: QColor) -> None:
+        if QColor(color) != self._active_color:
+            self._active_color = QColor(color)
             self._retarget(instant=True)
 
     def _get_pill_radius(self) -> int:
@@ -664,16 +683,20 @@ class HoverPillFrame(QFrame):
 
     hovercolor = pyqtProperty(QColor, _get_hover_color, _set_hover_color)
     presscolor = pyqtProperty(QColor, _get_press_color, _set_press_color)
+    activecolor = pyqtProperty(QColor, _get_active_color, _set_active_color)
     pillradius = pyqtProperty(int, _get_pill_radius, _set_pill_radius)
     pillinsetx = pyqtProperty(int, _get_inset_x, _set_inset_x)
     pillinsety = pyqtProperty(int, _get_inset_y, _set_inset_y)
 
     def enterEvent(self, event) -> None:
+        # Qt sees the pointer again: from here Enter and Leave drive the pill
+        self._proxy_timer.stop()
         self._hovered = True
         self._retarget()
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self._proxy_timer.stop()
         self._hovered = False
         self._pressed = False
         self._retarget()
@@ -693,15 +716,58 @@ class HoverPillFrame(QFrame):
         super().mouseReleaseEvent(event)
 
     def release_hover(self) -> None:
-        """Fade the pill out now: a popup opened and took the mouse, so no Leave may come."""
+        """Fade the hover out now: a popup opened and took the mouse, so no Leave may come (an active pill stays)."""
+        self._proxy_timer.stop()
         if self._hovered or self._pressed:
             self._hovered = False
             self._pressed = False
             self._retarget()
 
+    def hover_by_proxy(self) -> None:
+        """Light the pill for a pointer Qt cannot report: a popup holds the mouse, so no Enter comes."""
+        if self._hovered or self._active or not self._hover_color.alpha():
+            return
+        self._hovered = True
+        self._proxy_timer.start()
+        self._retarget()
+
+    def set_active(self, active: bool) -> None:
+        """Hold the active colour while this widget's popup is open.
+
+        On release, a pointer still on the widget keeps the pill lit as hover, followed by proxy because
+        the closing popup may still hold the mouse; otherwise the pill fades out with the popup.
+        """
+        if active == self._active:
+            return
+        self._active = active
+        self._pressed = False
+        self._proxy_timer.stop()
+        self._hovered = not active and self._pointer_inside()
+        if self._hovered:
+            self._proxy_timer.start()
+        self._retarget()
+
+    def _pointer_inside(self) -> bool:
+        return self.isVisible() and self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
+    def _follow_pointer(self) -> None:
+        if not self._pointer_inside():
+            self._proxy_timer.stop()
+            self._hovered = False
+            self._pressed = False
+            self._retarget()
+
+    def _active_target_color(self) -> QColor:
+        for color in (self._active_color, self._press_color, self._hover_color):
+            if color.alpha():
+                return color
+        return self._hover_color
+
     def _target(self) -> list[float]:
         if self._pressed and self._press_color.alpha():
             color = self._press_color
+        elif self._active:
+            color = self._active_target_color()
         elif self._hovered or self._pressed:
             color = self._hover_color
         else:
@@ -733,6 +799,15 @@ class HoverPillFrame(QFrame):
             painter.drawRoundedRect(rect, self._pill_radius, self._pill_radius)
             painter.end()
         super().paintEvent(event)
+
+
+def hover_by_proxy_at(global_pos: QPoint) -> None:
+    """A popup holds the mouse, so the bar sees no Enter: light the hover pill of the bar widget under global_pos."""
+    widget = QApplication.widgetAt(global_pos)
+    while widget is not None and not isinstance(widget, HoverPillFrame):
+        widget = widget.parentWidget()
+    if widget is not None:
+        widget.hover_by_proxy()
 
 
 class SpringMotion(QObject):

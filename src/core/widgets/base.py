@@ -82,6 +82,10 @@ class BaseWidget(QWidget):
             w.style().unpolish(w)
             w.style().polish(w)
 
+    def set_popup_active(self, active: bool) -> None:
+        """Hold the widget's pill while its popup is open, like a menu title in a menu bar."""
+        self._widget_frame.set_active(active)
+
     def _handle_hotkey_event(self, widget_name: str, action: str, target_screen: str) -> None:
         """
         Handle incoming hotkey events.

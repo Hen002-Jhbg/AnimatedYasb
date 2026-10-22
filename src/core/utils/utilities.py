@@ -27,6 +27,7 @@ from PyQt6.QtGui import (
     QShowEvent,
     QStaticText,
     QTransform,
+    QWindow,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -52,6 +53,7 @@ from core.utils.motion import (
     SnapshotGhost,
     SnapshotMotion,
     WindowMotion,
+    hover_by_proxy_at,
 )
 from core.utils.qobject import is_valid_qobject
 from core.utils.system import is_windows_10
@@ -482,6 +484,7 @@ class PopupWidget(QWidget):
 
     def show_animated(self):
         """Fade in and slide into place from the bar side."""
+        self._set_trigger_active(True)
         self._motion.enter(self.pos(), self._slide_offset(), POPUP_ENTER_MS if self._animated else 0)
 
     def hide_animated(self):
@@ -489,6 +492,8 @@ class PopupWidget(QWidget):
         if self._is_closing:
             return
         self._is_closing = True
+        # The bar widget lets its pill go as the popup starts to leave
+        self._set_trigger_active(False)
         # Clicks on the bar should work again while the popup fades out
         try:
             QApplication.instance().removeEventFilter(self)
@@ -501,6 +506,7 @@ class PopupWidget(QWidget):
         self._motion.stop()
 
         self._is_closing = True
+        self._set_trigger_active(False)
 
         # Remove from registry
         try:
@@ -597,6 +603,14 @@ class PopupWidget(QWidget):
     def eventFilter(self, obj, event):
         if not isinstance(obj, QObject):
             return False
+        if (
+            event.type() == QEvent.Type.MouseMove
+            and isinstance(obj, QWindow)
+            and QApplication.activePopupWidget() is not None
+        ):
+            # A popup holds the mouse, so the bar gets no Enter or Leave: light its hover pills by proxy
+            # (each move also reaches the popup widget; the QWindow copy is enough)
+            hover_by_proxy_at(event.globalPosition().toPoint())
         if self._suspend_close or self._pinned:
             return super().eventFilter(obj, event)
         if event.type() == QEvent.Type.MouseButtonPress:
@@ -673,6 +687,12 @@ class PopupWidget(QWidget):
         if trigger is None or not is_valid_qobject(trigger) or not trigger.isVisible():
             return False
         return trigger.rect().contains(trigger.mapFromGlobal(global_pos))
+
+    def _set_trigger_active(self, active: bool) -> None:
+        """Hold the bar widget's pill while this popup is open, like a menu title in a menu bar."""
+        trigger = self._parent
+        if trigger is not None and is_valid_qobject(trigger) and hasattr(trigger, "set_popup_active"):
+            trigger.set_popup_active(active)
 
     def set_auto_close_enabled(self, enabled: bool):
         """Enable/disable auto-close behavior when clicking outside."""
