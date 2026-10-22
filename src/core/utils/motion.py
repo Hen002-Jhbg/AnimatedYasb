@@ -448,13 +448,22 @@ class ValueMotion(QObject):
         """Stop where it is, without emitting finished."""
         self._springs.stop()
 
-    def start(self, start: float, end: float, duration_ms: int, exiting: bool = False, surface: str | None = None) -> None:
+    def start(
+        self,
+        start: float,
+        end: float,
+        duration_ms: int,
+        exiting: bool = False,
+        surface: str | None = None,
+        opacity_only: bool = False,
+    ) -> None:
         """Head for end; from start when at rest, from where it is when running. Any duration > 0 springs.
 
         surface, when given, replaces this motion's own spring for this run; a running motion keeps its
-        position and speed and only changes spring and target.
+        position and speed and only changes spring and target. opacity_only marks a run that moves
+        nothing (a fade), which keeps animating with Windows "Animation effects" off.
         """
-        if duration_ms <= 0 or not animations_enabled():
+        if duration_ms <= 0 or (not animations_enabled() and not opacity_only):
             self._springs.jump([end])
             self.finished.emit()
             return
@@ -784,7 +793,8 @@ class HoverPillFrame(QFrame):
 
     def _retarget(self, instant: bool = False) -> None:
         target = self._target()
-        if instant or not animations_enabled():
+        # Colour only, nothing moves: it still fades with Windows "Animation effects" off (reduced motion)
+        if instant:
             self._color.jump(target)
             return
         if self._color.values[3] < 0.5:

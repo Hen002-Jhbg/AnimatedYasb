@@ -35,7 +35,7 @@ from PyQt6.QtWidgets import (
 from win32con import HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE
 
 from core.utils.controller import exit_application, reload_application
-from core.utils.motion import ValueMotion
+from core.utils.motion import ValueMotion, animations_enabled
 from core.utils.utilities import AnimatedContextMenu, refresh_widget_style
 from core.utils.win32.app_bar import APPBAR_CALLBACK_MESSAGE, AppBarNotify
 from core.utils.win32.bindings import SetWindowPos
@@ -108,7 +108,7 @@ class BarAnimationManager(QObject):
         if not self.bar_widget._animation.get("enabled"):
             self.bar_widget.show()
             return
-        if self.bar_widget._animation.get("type") == "fade":
+        if self._use_fade():
             self._start_fade(True)
         else:
             self._start_slide(True)
@@ -119,10 +119,14 @@ class BarAnimationManager(QObject):
             self.bar_widget.hide()
             self.bar_widget._skip_animation = False
             return
-        if self.bar_widget._animation.get("type") == "fade":
+        if self._use_fade():
             self._start_fade(False)
         else:
             self._start_slide(False)
+
+    def _use_fade(self) -> bool:
+        """Fade in place when the config asks for it, or with Windows "Animation effects" off (no movement)."""
+        return self.bar_widget._animation.get("type") == "fade" or not animations_enabled()
 
     def _is_running(self) -> bool:
         return self._motion.is_running()
@@ -183,7 +187,9 @@ class BarAnimationManager(QObject):
         self._showing = show
         # duration: 0 in the config still means no animation; any other value uses the bar's spring
         duration = self.bar_widget._animation.get("duration", 300)
-        self._motion.start(start, 1.0 if show else 0.0, duration, exiting=not show, surface=self._surface())
+        self._motion.start(
+            start, 1.0 if show else 0.0, duration, exiting=not show, surface=self._surface(), opacity_only=self._mode == "fade"
+        )
 
     def _surface(self) -> str:
         """An auto-hiding bar is revealed under a pointer that is already waiting, so it comes quicker."""

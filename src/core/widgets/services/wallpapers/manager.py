@@ -10,6 +10,7 @@ from comtypes import GUID
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from core.events.service import EventService
+from core.utils.motion import animations_enabled
 from core.utils.win32.bindings.shell32 import IDesktopWallpaper
 from core.widgets.services.wallpapers.engine import WallpaperEngine
 from core.widgets.services.wallpapers.images import collect_image_files
@@ -81,7 +82,8 @@ class WallpaperManager(QObject):
     def set_wallpaper(self, image_path: str, monitor_id: str | None = None, animate: bool = True):
         """Set the desktop wallpaper, using the YASB engine animation when enabled."""
         eng = self._engine_config
-        if animate and monitor_id is None and eng and eng.enabled:
+        # With Windows "Animation effects" off, no full-screen sweep: Windows applies it, following the setting
+        if animate and monitor_id is None and eng and eng.enabled and animations_enabled():
             try:
                 self._engine = WallpaperEngine(image_path, eng.animation)
                 self._engine.finished.connect(lambda: self.set_wallpaper(image_path, animate=False))
