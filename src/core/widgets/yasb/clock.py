@@ -260,6 +260,9 @@ class CustomCalendar(QCalendarWidget):
         self._inset_y = 0
         # Days of the months around the shown one, dimmed as in the Windows 11 calendar (no colour: as is)
         self._other_month_color = QColor(0, 0, 0, 0)
+        # Today's (the selected day's) capsule, painted like the pill so it has the same shape and smooth
+        # edges; the stylesheet's own ::item:selected background is not antialiased (no colour: Qt's own)
+        self._selected_color = QColor(0, 0, 0, 0)
         super().__init__(parent)
         self.timezone = timezone
         self.country_code = country_code
@@ -281,6 +284,9 @@ class CustomCalendar(QCalendarWidget):
             table_view.setProperty("class", "calendar-table")
             palette = table_view.palette()
             palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 0, 0, 0))
+            # Qt's Windows 11 style marks the selected item with an accent bar at its left, which cut into
+            # the left end of today's capsule
+            palette.setColor(QPalette.ColorRole.Accent, QColor(0, 0, 0, 0))
             palette.setColor(QPalette.ColorRole.HighlightedText, palette.color(QPalette.ColorRole.Text))
             table_view.setPalette(palette)
             viewport = table_view.viewport()
@@ -345,12 +351,20 @@ class CustomCalendar(QCalendarWidget):
         self._other_month_color = QColor(color)
         self.updateCells()
 
+    def _get_selected_color(self) -> QColor:
+        return self._selected_color
+
+    def _set_selected_color(self, color: QColor) -> None:
+        self._selected_color = QColor(color)
+        self.updateCells()
+
     hovercolor = pyqtProperty(QColor, _get_hover_color, _set_hover_color)
     presscolor = pyqtProperty(QColor, _get_press_color, _set_press_color)
     pillradius = pyqtProperty(int, _get_pill_radius, _set_pill_radius)
     pillinsetx = pyqtProperty(int, _get_inset_x, _set_inset_x)
     pillinsety = pyqtProperty(int, _get_inset_y, _set_inset_y)
     othermonthcolor = pyqtProperty(QColor, _get_other_month_color, _set_other_month_color)
+    selectedcolor = pyqtProperty(QColor, _get_selected_color, _set_selected_color)
 
     def eventFilter(self, obj, event):
         if self._hover is not None and obj is self._hover_viewport:
@@ -396,18 +410,23 @@ class CustomCalendar(QCalendarWidget):
         """Custom paint for cells: a hover pill under the day, holiday dates in holiday_color."""
         if date < self.minimumDate() or date > self.maximumDate():
             return
+        selected = date == self.selectedDate()
+        color = None
+        if selected:
+            # Today's capsule, in the pill's shape (the selected day gets no hover pill)
+            color = self._selected_color if self._selected_color.alpha() else None
+        elif self._hover is not None:
+            color = self._hover.pill_color(date)
         if self._hover is not None:
             self._hover.note_rect(date, rect)
-            color = self._hover.pill_color(date)
-            # The selected day (today) keeps its own accent capsule from the stylesheet
-            if color is not None and date != self.selectedDate():
-                painter.save()
-                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(color)
-                pill = QRectF(rect).adjusted(self._inset_x, self._inset_y, -self._inset_x, -self._inset_y)
-                painter.drawRoundedRect(pill, self._pill_radius, self._pill_radius)
-                painter.restore()
+        if color is not None:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            pill = QRectF(rect).adjusted(self._inset_x, self._inset_y, -self._inset_x, -self._inset_y)
+            painter.drawRoundedRect(pill, self._pill_radius, self._pill_radius)
+            painter.restore()
         shown = date.month() == self.monthShown() and date.year() == self.yearShown()
         if not shown and self._other_month_color.alpha() and date != self.selectedDate():
             # A day of the month before or after: same number, dimmed
