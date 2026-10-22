@@ -85,6 +85,7 @@ class BarAnimationManager(QObject):
     One progress value drives the motion, 0 hidden and 1 shown, on the bar's spring (motion.SPRINGS).
     Showing while a hide is running (or the other way round) turns around from where the bar is, at the
     speed it has, instead of waiting for the end. Hiding is the system answering, so its spring is quicker.
+    An auto-hiding bar uses the "autohide" spring, quicker to arrive.
     """
 
     # True once the bar has finished showing, False once it has finished hiding
@@ -182,7 +183,12 @@ class BarAnimationManager(QObject):
         self._showing = show
         # duration: 0 in the config still means no animation; any other value uses the bar's spring
         duration = self.bar_widget._animation.get("duration", 300)
-        self._motion.start(start, 1.0 if show else 0.0, duration, exiting=not show)
+        self._motion.start(start, 1.0 if show else 0.0, duration, exiting=not show, surface=self._surface())
+
+    def _surface(self) -> str:
+        """An auto-hiding bar is revealed under a pointer that is already waiting, so it comes quicker."""
+        manager = getattr(self.bar_widget, "_autohide_manager", None)
+        return "autohide" if manager is not None and manager.is_enabled() else "bar"
 
     def _apply(self, value: float) -> None:
         self._progress = value
@@ -324,9 +330,17 @@ class AutoHideManager(QObject):
         self._hide_timer.start(self._autohide_delay)
 
     def show_bar(self):
-        """Show the bar when mouse hovers over detection zone"""
-        if not self.bar_widget.isVisible() and self._is_enabled:
+        """Show the bar when the pointer reaches the screen edge; a bar still sliding away turns around."""
+        if not self._is_enabled:
+            return
+        if self._hide_timer:
+            self._hide_timer.stop()
+        animation = getattr(self.bar_widget, "_animation_manager", None)
+        if not self.bar_widget.isVisible():
             self.bar_widget.show()
+        elif animation is not None and animation.is_hiding():
+            # Still on screen on its way out: come back from where it is, at the speed it has
+            self.bar_widget.show_bar()
 
     def _is_child_of_bar(self, widget):
         """Walk parent chain to check if widget belongs to this bar."""
@@ -342,9 +356,9 @@ class AutoHideManager(QObject):
         # Qt::Popup windows (QMenu, PopupWidget)
         if QApplication.activePopupWidget():
             return True
-        # Qt::Tool windows that called activateWindow() (SystrayPopup)
+        # Qt::Tool windows that called activateWindow() (SystrayPopup); the edge zone is not one of them
         active = QApplication.activeWindow()
-        if active and active is not self.bar_widget and self._is_child_of_bar(active):
+        if active and active is not self.bar_widget and active is not self._detection_zone and self._is_child_of_bar(active):
             return True
         # Check all visible top-level widgets
         cursor_pos = QCursor.pos()
@@ -376,6 +390,10 @@ class AutoHideManager(QObject):
             if event.type() == QEvent.Type.Enter:
                 if self._hide_timer:
                     self._hide_timer.stop()
+                animation = getattr(self.bar_widget, "_animation_manager", None)
+                if animation is not None and animation.is_hiding():
+                    # The pointer came back onto the bar while it slides away: bring it back
+                    self.bar_widget.show_bar()
             elif event.type() == QEvent.Type.Leave:
                 cursor_pos = QCursor.pos()
                 bar_geometry = self.bar_widget.geometry()

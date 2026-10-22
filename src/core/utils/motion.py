@@ -140,6 +140,8 @@ SPRINGS = {
     "hover": (0.10, 0.16, 1.0),
     # Quick Launch, summoned from the keyboard many times a day: quicker than a popup both ways
     "launcher": (0.24, 0.15, 1.0),
+    # An auto-hiding bar, revealed under a pointer already waiting at the screen edge: in place sooner
+    "autohide": (0.30, 0.24, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
@@ -446,15 +448,19 @@ class ValueMotion(QObject):
         """Stop where it is, without emitting finished."""
         self._springs.stop()
 
-    def start(self, start: float, end: float, duration_ms: int, exiting: bool = False) -> None:
-        """Head for end; from start when at rest, from where it is when running. Any duration > 0 springs."""
+    def start(self, start: float, end: float, duration_ms: int, exiting: bool = False, surface: str | None = None) -> None:
+        """Head for end; from start when at rest, from where it is when running. Any duration > 0 springs.
+
+        surface, when given, replaces this motion's own spring for this run; a running motion keeps its
+        position and speed and only changes spring and target.
+        """
         if duration_ms <= 0 or not animations_enabled():
             self._springs.jump([end])
             self.finished.emit()
             return
         if not self.is_running():
             self._springs.jump([start])
-        self._response, damping = spring_params(self._surface, exiting)
+        self._response, damping = spring_params(surface or self._surface, exiting)
         self._springs.animate([end], self._response, damping, [self._precision])
 
     def _emit_value(self) -> None:
