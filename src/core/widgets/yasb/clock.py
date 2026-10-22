@@ -258,6 +258,8 @@ class CustomCalendar(QCalendarWidget):
         self._pill_radius = 12
         self._inset_x = 0
         self._inset_y = 0
+        # Days of the months around the shown one, dimmed as in the Windows 11 calendar (no colour: as is)
+        self._other_month_color = QColor(0, 0, 0, 0)
         super().__init__(parent)
         self.timezone = timezone
         self.country_code = country_code
@@ -336,11 +338,19 @@ class CustomCalendar(QCalendarWidget):
     def _set_inset_y(self, inset: int) -> None:
         self._inset_y = int(inset)
 
+    def _get_other_month_color(self) -> QColor:
+        return self._other_month_color
+
+    def _set_other_month_color(self, color: QColor) -> None:
+        self._other_month_color = QColor(color)
+        self.updateCells()
+
     hovercolor = pyqtProperty(QColor, _get_hover_color, _set_hover_color)
     presscolor = pyqtProperty(QColor, _get_press_color, _set_press_color)
     pillradius = pyqtProperty(int, _get_pill_radius, _set_pill_radius)
     pillinsetx = pyqtProperty(int, _get_inset_x, _set_inset_x)
     pillinsety = pyqtProperty(int, _get_inset_y, _set_inset_y)
+    othermonthcolor = pyqtProperty(QColor, _get_other_month_color, _set_other_month_color)
 
     def eventFilter(self, obj, event):
         if self._hover is not None and obj is self._hover_viewport:
@@ -398,6 +408,14 @@ class CustomCalendar(QCalendarWidget):
                 pill = QRectF(rect).adjusted(self._inset_x, self._inset_y, -self._inset_x, -self._inset_y)
                 painter.drawRoundedRect(pill, self._pill_radius, self._pill_radius)
                 painter.restore()
+        shown = date.month() == self.monthShown() and date.year() == self.yearShown()
+        if not shown and self._other_month_color.alpha() and date != self.selectedDate():
+            # A day of the month before or after: same number, dimmed
+            painter.save()
+            painter.setPen(self._other_month_color)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(date.day()))
+            painter.restore()
+            return
         pydate = date.toPyDate()
         is_holiday = self.show_holidays and pydate in self._holidays
         if is_holiday:
