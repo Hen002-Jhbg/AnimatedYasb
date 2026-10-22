@@ -826,6 +826,130 @@ def hover_by_proxy_at(global_pos: QPoint) -> None:
         widget.hover_by_proxy()
 
 
+class HoverCells(QObject):
+    """Hover and press pills for the cells of a view that paints its own cells (a calendar's days).
+
+    HoverPillFrame's behaviour, per cell: the cell under the pointer fades in on the "hover" spring
+    while the one it left fades out, a left press jumps to the press colour at once and the release
+    eases back. The painter records each cell's rect with note_rect() and asks pill_color() what to
+    draw before it paints the cell's content. Cells at rest cost nothing; a fading cell repaints only
+    its own rect. Colour only, nothing moves, so it keeps fading with Windows "Animation effects" off.
+    """
+
+    def __init__(self, viewport: QWidget):
+        super().__init__(viewport)
+        self._viewport = viewport
+        self._rects: dict = {}
+        # key -> SpringGroup with two numbers, hover and press, each 0..1
+        self._springs: dict = {}
+        self._hovered = None
+        self._pressed = None
+        self.hover_color = QColor(0, 0, 0, 0)
+        self.press_color = QColor(0, 0, 0, 0)
+
+    def note_rect(self, key, rect: QRect) -> None:
+        self._rects[key] = QRect(rect)
+
+    def key_at(self, pos: QPoint):
+        for key, rect in self._rects.items():
+            if rect.contains(pos):
+                return key
+        return None
+
+    def set_hovered(self, key) -> None:
+        if key == self._hovered:
+            return
+        old, self._hovered = self._hovered, key
+        if self._pressed is not None and self._pressed != key:
+            # Leaving a pressed cell lets the press go, as HoverPillFrame does on leave
+            old_pressed, self._pressed = self._pressed, None
+            if old_pressed != old:
+                self._retarget(old_pressed)
+        for k in (old, key):
+            if k is not None:
+                self._retarget(k)
+
+    def set_pressed(self, key) -> None:
+        """A left press on key, or None on release."""
+        if key == self._pressed:
+            return
+        old, self._pressed = self._pressed, key
+        if key is not None:
+            springs = self._springs_for(key)
+            # Feedback the moment the button goes down, before the click completes
+            springs.jump([springs.values[0], 1.0])
+            self._retarget(key)
+        if old is not None:
+            self._retarget(old)
+
+    def reset(self) -> None:
+        """Forget every pill at once (the page changed under the pointer)."""
+        self._hovered = None
+        self._pressed = None
+        for springs in self._springs.values():
+            springs.stop()
+            springs.deleteLater()
+        self._springs.clear()
+        self._rects.clear()
+        self._viewport.update()
+
+    def pill_color(self, key) -> QColor | None:
+        """The colour to paint under the cell now, or None when there is no pill."""
+        springs = self._springs.get(key)
+        if springs is None or not self.hover_color.alpha():
+            return None
+        hover, press = springs.values
+        strength = min(1.0, max(hover, press))
+        if strength <= 0.002:
+            return None
+        target = self.press_color if self.press_color.alpha() else self.hover_color
+        t = min(1.0, max(0.0, press))
+        base = self.hover_color
+
+        def mix(a: float, b: float) -> float:
+            return a + (b - a) * t
+
+        return QColor.fromRgbF(
+            mix(base.redF(), target.redF()),
+            mix(base.greenF(), target.greenF()),
+            mix(base.blueF(), target.blueF()),
+            mix(base.alphaF(), target.alphaF()) * strength,
+        )
+
+    def _springs_for(self, key) -> SpringGroup:
+        springs = self._springs.get(key)
+        if springs is None:
+            springs = SpringGroup(self._viewport, 2)
+            springs.jump([0.0, 0.0])
+            springs.changed.connect(lambda k=key: self._repaint(k))
+            springs.settled.connect(lambda k=key: self._drop_if_idle(k))
+            self._springs[key] = springs
+        return springs
+
+    def _retarget(self, key) -> None:
+        springs = self._springs_for(key)
+        target = [1.0 if key == self._hovered else 0.0, 1.0 if key == self._pressed else 0.0]
+        leaving = target[0] < springs.values[0]
+        response, damping = spring_params("hover", exiting=leaving)
+        springs.animate(target, response, damping, [0.004, 0.004])
+
+    def _repaint(self, key) -> None:
+        rect = self._rects.get(key)
+        if rect is not None:
+            self._viewport.update(rect)
+        else:
+            self._viewport.update()
+
+    def _drop_if_idle(self, key) -> None:
+        springs = self._springs.get(key)
+        if springs is None or key == self._hovered or key == self._pressed:
+            return
+        if max(springs.values) <= 0.002:
+            del self._springs[key]
+            springs.deleteLater()
+            self._repaint(key)
+
+
 class SpringMotion(QObject):
     """Moves one number toward a target on a critically damped spring (no overshoot).
 

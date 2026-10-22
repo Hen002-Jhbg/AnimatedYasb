@@ -8,8 +8,8 @@ from datetime import date, datetime, timedelta
 from itertools import cycle
 from zoneinfo import ZoneInfo, available_timezones
 
-from PyQt6.QtCore import QDate, QLocale, QPoint, Qt, QTimer
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtCore import QDate, QEvent, QLocale, QPoint, QRectF, Qt, QTimer, pyqtProperty
+from PyQt6.QtGui import QColor, QPainter, QPalette
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.config import HOME_CONFIGURATION_DIR
+from core.utils.motion import HoverCells
 from core.utils.tooltip import set_tooltip
 from core.utils.utilities import AnimatedContextMenu, PopupWidget, refresh_widget_style
 from core.utils.win32.backdrop import enable_blur
@@ -249,6 +250,14 @@ class CustomCalendar(QCalendarWidget):
         holiday_color=None,
     ):
         """Calendar widget with optional holiday highlighting by country."""
+        # Windows 11-style hover pills on the days, painted under the numbers (see HoverCells)
+        self._hover: HoverCells | None = None
+        self._hover_viewport = None
+        self._hover_color = QColor(0, 0, 0, 0)
+        self._press_color = QColor(0, 0, 0, 0)
+        self._pill_radius = 12
+        self._inset_x = 0
+        self._inset_y = 0
         super().__init__(parent)
         self.timezone = timezone
         self.country_code = country_code
@@ -272,6 +281,17 @@ class CustomCalendar(QCalendarWidget):
             palette.setColor(QPalette.ColorRole.Highlight, QColor(0, 0, 0, 0))
             palette.setColor(QPalette.ColorRole.HighlightedText, palette.color(QPalette.ColorRole.Text))
             table_view.setPalette(palette)
+            viewport = table_view.viewport()
+            self._hover = HoverCells(viewport)
+            self._hover.hover_color = QColor(self._hover_color)
+            self._hover.press_color = QColor(self._press_color)
+            self._hover_viewport = viewport
+            table_view.setMouseTracking(True)
+            viewport.setMouseTracking(True)
+            viewport.installEventFilter(self)
+
+        # The theme sets the pill's colours and shape on this class (lowercase qproperties)
+        self.setProperty("class", "calendar-days")
 
         if parent and parent._locale:
             qt_locale = QLocale(parent._locale)
@@ -280,6 +300,61 @@ class CustomCalendar(QCalendarWidget):
         self.update_calendar_display()
         self._update_holidays_for_year(self.selectedDate().year())
         self.currentPageChanged.connect(self._on_page_changed)
+
+    def _get_hover_color(self) -> QColor:
+        return self._hover_color
+
+    def _set_hover_color(self, color: QColor) -> None:
+        self._hover_color = QColor(color)
+        if self._hover is not None:
+            self._hover.hover_color = QColor(color)
+            self._hover._viewport.update()
+
+    def _get_press_color(self) -> QColor:
+        return self._press_color
+
+    def _set_press_color(self, color: QColor) -> None:
+        self._press_color = QColor(color)
+        if self._hover is not None:
+            self._hover.press_color = QColor(color)
+
+    def _get_pill_radius(self) -> int:
+        return self._pill_radius
+
+    def _set_pill_radius(self, radius: int) -> None:
+        self._pill_radius = int(radius)
+
+    def _get_inset_x(self) -> int:
+        return self._inset_x
+
+    def _set_inset_x(self, inset: int) -> None:
+        self._inset_x = int(inset)
+
+    def _get_inset_y(self) -> int:
+        return self._inset_y
+
+    def _set_inset_y(self, inset: int) -> None:
+        self._inset_y = int(inset)
+
+    hovercolor = pyqtProperty(QColor, _get_hover_color, _set_hover_color)
+    presscolor = pyqtProperty(QColor, _get_press_color, _set_press_color)
+    pillradius = pyqtProperty(int, _get_pill_radius, _set_pill_radius)
+    pillinsetx = pyqtProperty(int, _get_inset_x, _set_inset_x)
+    pillinsety = pyqtProperty(int, _get_inset_y, _set_inset_y)
+
+    def eventFilter(self, obj, event):
+        if self._hover is not None and obj is self._hover_viewport:
+            kind = event.type()
+            if kind == QEvent.Type.MouseMove:
+                self._hover.set_hovered(self._hover.key_at(event.position().toPoint()))
+            elif kind == QEvent.Type.Leave:
+                self._hover.set_hovered(None)
+            elif kind == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+                self._hover.set_pressed(self._hover.key_at(event.position().toPoint()))
+            elif kind == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                self._hover.set_pressed(None)
+        # QCalendarWidget filters its own children too; never consume the event here
+        return super().eventFilter(obj, event)
 
     def _update_holidays_for_year(self, year):
         """Update the holiday cache for the given year (if supported)."""
@@ -303,11 +378,26 @@ class CustomCalendar(QCalendarWidget):
         """When calendar page changes, refresh holidays if year changed."""
         if year != self._current_year:
             self._update_holidays_for_year(year)
+        if self._hover is not None:
+            # Other days now sit under the pointer; the next mouse move finds the right one
+            self._hover.reset()
 
     def paintCell(self, painter, rect, date):
-        """Custom paint for cells; draw holiday dates in holiday_color."""
+        """Custom paint for cells: a hover pill under the day, holiday dates in holiday_color."""
         if date < self.minimumDate() or date > self.maximumDate():
             return
+        if self._hover is not None:
+            self._hover.note_rect(date, rect)
+            color = self._hover.pill_color(date)
+            # The selected day (today) keeps its own accent capsule from the stylesheet
+            if color is not None and date != self.selectedDate():
+                painter.save()
+                painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(color)
+                pill = QRectF(rect).adjusted(self._inset_x, self._inset_y, -self._inset_x, -self._inset_y)
+                painter.drawRoundedRect(pill, self._pill_radius, self._pill_radius)
+                painter.restore()
         pydate = date.toPyDate()
         is_holiday = self.show_holidays and pydate in self._holidays
         if is_holiday:
