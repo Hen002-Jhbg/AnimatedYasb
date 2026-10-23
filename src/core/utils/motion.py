@@ -142,8 +142,9 @@ SPRINGS = {
     "launcher": (0.24, 0.15, 1.0),
     # An auto-hiding bar, revealed under a pointer already waiting at the screen edge: in place sooner
     "autohide": (0.30, 0.24, 1.0),
-    # A calendar's months scrolling by: one spring both ways, keeping its speed through a fast wheel spin
-    "calendar": (0.30, 0.30, 1.0),
+    # A calendar's months scrolling by: one slow, soft spring both ways (felt better than 0.30 and 0.45),
+    # keeping its speed through a fast wheel spin
+    "calendar": (0.60, 0.60, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
