@@ -34,7 +34,7 @@ from PyQt6.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QCursor, QPainter
+from PyQt6.QtGui import QColor, QCursor, QLinearGradient, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QFrame, QWidget
 
 POPUP_ENTER_MS = 200
@@ -142,6 +142,8 @@ SPRINGS = {
     "launcher": (0.24, 0.15, 1.0),
     # An auto-hiding bar, revealed under a pointer already waiting at the screen edge: in place sooner
     "autohide": (0.30, 0.24, 1.0),
+    # A calendar's months scrolling by: one spring both ways, keeping its speed through a fast wheel spin
+    "calendar": (0.30, 0.30, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
@@ -948,6 +950,154 @@ class HoverCells(QObject):
             del self._springs[key]
             springs.deleteLater()
             self._repaint(key)
+
+
+class PageSlide(QWidget):
+    """Scrolls a calendar's grid from one month to the next as one continuous ribbon of weeks.
+
+    Apple-style: the rows move vertically, at sub-pixel precision, on a critically damped spring, and each
+    week appears once. The week that two months share (late October with early November) is in both page
+    snapshots; its look (dimmed or not) crossfades as the ribbon moves, so the first frame is exactly the
+    old page and the last exactly the new one. Another page change mid-way only moves the target and keeps
+    the speed, so a fast wheel spin glides through the months, and turning back is smooth. It is a
+    click-through overlay painting snapshots; the widget underneath already shows the new page and takes
+    over when the motion settles. While it moves, the edges fade into the background, so rows slip under
+    the weekday header instead of being cut. With Windows "Animation effects" off the pages crossfade in
+    place instead (nothing moves).
+    """
+
+    finished = pyqtSignal()
+
+    # How far the edges fade into the background while rows move, in pixels
+    EDGE_FADE_PX = 10
+
+    def __init__(self, parent: QWidget, rows_per_page: int = 6):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+        self._rows = rows_per_page
+        # page key -> (snapshot of its rows, absolute index of its first row)
+        self._pages: dict = {}
+        self._background = QColor(0, 0, 0, 0)
+        self._fade = False
+        self._spring = SpringGroup(self, 1)
+        self._spring.changed.connect(self.update)
+        self._spring.settled.connect(self._on_settled)
+
+    def has_page(self, key: int) -> bool:
+        return key in self._pages
+
+    def keep_page(self, key: int, pixmap: QPixmap, first_row: int) -> None:
+        """A page's snapshot (its rows only) and the absolute index of its first row (weeks)."""
+        self._pages[key] = (pixmap, int(first_row))
+        if not self._background.alpha() and not pixmap.isNull():
+            # The page's own background, so the overlay is opaque and the edges fade into it
+            self._background = pixmap.toImage().pixelColor(1, 1)
+
+    def is_running(self) -> bool:
+        return self.isVisible() and self._spring.is_running()
+
+    def position(self) -> float:
+        """The absolute row now at the top of the grid."""
+        return self._spring.values[0]
+
+    def go(self, from_key: int, to_key: int) -> None:
+        """Head for page to_key; from from_key at rest, from where it is (and at its speed) mid-way."""
+        if from_key == to_key or from_key not in self._pages or to_key not in self._pages:
+            return
+        from_row = self._pages[from_key][1]
+        pixmap, to_row = self._pages[to_key]
+        if abs(to_row - from_row) > self._rows:
+            # A jump of several months at once (a keyboard shortcut) scrolls by one page
+            to_row = from_row + (self._rows if to_row > from_row else -self._rows)
+            self._pages[to_key] = (pixmap, to_row)
+        if not self.is_running():
+            self._fade = not animations_enabled()
+            self._spring.jump([float(from_row)])
+        self.raise_()
+        self.show()
+        response, damping = spring_params("calendar")
+        self._spring.animate([float(to_row)], response, damping, [0.01])
+
+    def stop(self) -> None:
+        self._spring.stop()
+        self.hide()
+        self._pages.clear()
+
+    def _on_settled(self) -> None:
+        self.hide()
+        self._pages.clear()
+        self.finished.emit()
+
+    def _draw_row(self, painter: QPainter, pixmap: QPixmap, page_row: int, y: float, row_h: float) -> None:
+        source_h = pixmap.height() / self._rows
+        painter.drawPixmap(
+            QRectF(0.0, y, float(self.width()), row_h),
+            pixmap,
+            QRectF(0.0, page_row * source_h, float(pixmap.width()), source_h),
+        )
+
+    def paintEvent(self, event) -> None:
+        p = self._spring.values[0]
+        row_h = self.height() / self._rows
+        pages = sorted((first_row, pixmap) for pixmap, first_row in self._pages.values())
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), self._background)
+        if self._fade:
+            self._paint_crossfade(painter, pages, p, row_h)
+        else:
+            top = math.floor(p)
+            for row in range(top, top + self._rows + 1):
+                covering = [(first, pixmap) for first, pixmap in pages if first <= row < first + self._rows]
+                if not covering:
+                    continue
+                y = (row - p) * row_h
+                first_a, pixmap_a = covering[0]
+                self._draw_row(painter, pixmap_a, row - first_a, y, row_h)
+                if len(covering) > 1:
+                    first_b, pixmap_b = covering[-1]
+                    # The week both months show: its look crossfades as the ribbon moves from one to the other
+                    weight = min(1.0, max(0.0, (p - first_a) / (first_b - first_a)))
+                    if weight > 0.0:
+                        painter.setOpacity(weight)
+                        self._draw_row(painter, pixmap_b, row - first_b, y, row_h)
+                        painter.setOpacity(1.0)
+            # The edges fade in as the rows leave their place and out as they arrive
+            strength = min(1.0, abs(self._spring.targets[0] - p) * 2.0)
+            if strength > 0.0:
+                self._fade_edges(painter, strength)
+        painter.end()
+
+    def _paint_crossfade(self, painter: QPainter, pages: list, p: float, row_h: float) -> None:
+        """Reduced motion: the page before the position, then the next one over it as the position nears it."""
+        below = [(first, pixmap) for first, pixmap in pages if first <= p]
+        above = [(first, pixmap) for first, pixmap in pages if first > p]
+        if below:
+            first, pixmap = below[-1]
+            painter.drawPixmap(QRectF(self.rect()), pixmap, QRectF(pixmap.rect()))
+            if above:
+                next_first, next_pixmap = above[0]
+                painter.setOpacity(min(1.0, max(0.0, (p - first) / (next_first - first))))
+                painter.drawPixmap(QRectF(self.rect()), next_pixmap, QRectF(next_pixmap.rect()))
+                painter.setOpacity(1.0)
+        elif above:
+            painter.drawPixmap(QRectF(self.rect()), above[0][1], QRectF(above[0][1].rect()))
+
+    def _fade_edges(self, painter: QPainter, strength: float) -> None:
+        band = min(self.EDGE_FADE_PX, self.height() // 4)
+        solid = QColor(self._background)
+        solid.setAlphaF(solid.alphaF() * strength)
+        clear = QColor(self._background)
+        clear.setAlpha(0)
+        top = QLinearGradient(0.0, 0.0, 0.0, float(band))
+        top.setColorAt(0.0, solid)
+        top.setColorAt(1.0, clear)
+        painter.fillRect(QRectF(0.0, 0.0, float(self.width()), float(band)), top)
+        bottom = QLinearGradient(0.0, float(self.height() - band), 0.0, float(self.height()))
+        bottom.setColorAt(0.0, clear)
+        bottom.setColorAt(1.0, solid)
+        painter.fillRect(QRectF(0.0, float(self.height() - band), float(self.width()), float(band)), bottom)
 
 
 class SpringMotion(QObject):

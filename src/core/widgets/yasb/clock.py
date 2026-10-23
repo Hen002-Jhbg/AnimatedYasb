@@ -8,8 +8,8 @@ from datetime import date, datetime, timedelta
 from itertools import cycle
 from zoneinfo import ZoneInfo, available_timezones
 
-from PyQt6.QtCore import QDate, QEvent, QLocale, QPoint, QRectF, Qt, QTimer, pyqtProperty
-from PyQt6.QtGui import QColor, QPainter, QPalette
+from PyQt6.QtCore import QDate, QEvent, QLocale, QPoint, QRect, QRectF, Qt, QTimer, pyqtProperty
+from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPalette, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.config import HOME_CONFIGURATION_DIR
-from core.utils.motion import HoverCells
+from core.utils.motion import HoverCells, PageSlide
 from core.utils.tooltip import set_tooltip
 from core.utils.utilities import AnimatedContextMenu, PopupWidget, refresh_widget_style
 from core.utils.win32.backdrop import enable_blur
@@ -263,6 +263,12 @@ class CustomCalendar(QCalendarWidget):
         # Today's (the selected day's) capsule, painted like the pill so it has the same shape and smooth
         # edges; the stylesheet's own ::item:selected background is not antialiased (no colour: Qt's own)
         self._selected_color = QColor(0, 0, 0, 0)
+        # Today's number, drawn in the capsule by the calendar (no colour: Qt's own selected text)
+        self._selected_text_color = QColor(0, 0, 0, 0)
+        # The months scroll by on a spring (PageSlide); the wheel's small steps add up to a month
+        self._slide: PageSlide | None = None
+        self._shown_key: int | None = None
+        self._wheel_acc = 0
         super().__init__(parent)
         self.timezone = timezone
         self.country_code = country_code
@@ -297,6 +303,10 @@ class CustomCalendar(QCalendarWidget):
             table_view.setMouseTracking(True)
             viewport.setMouseTracking(True)
             viewport.installEventFilter(self)
+            # Key presses reach the view itself; a page change from the keyboard slides too
+            table_view.installEventFilter(self)
+            self._slide = PageSlide(self)
+            self._slide.finished.connect(self._after_slide)
 
         # The theme sets the pill's colours and shape on this class (lowercase qproperties)
         self.setProperty("class", "calendar-days")
@@ -306,6 +316,7 @@ class CustomCalendar(QCalendarWidget):
             self.setLocale(qt_locale)
 
         self.update_calendar_display()
+        self._shown_key = self._page_key(self.yearShown(), self.monthShown())
         self._update_holidays_for_year(self.selectedDate().year())
         self.currentPageChanged.connect(self._on_page_changed)
 
@@ -358,6 +369,13 @@ class CustomCalendar(QCalendarWidget):
         self._selected_color = QColor(color)
         self.updateCells()
 
+    def _get_selected_text_color(self) -> QColor:
+        return self._selected_text_color
+
+    def _set_selected_text_color(self, color: QColor) -> None:
+        self._selected_text_color = QColor(color)
+        self.updateCells()
+
     hovercolor = pyqtProperty(QColor, _get_hover_color, _set_hover_color)
     presscolor = pyqtProperty(QColor, _get_press_color, _set_press_color)
     pillradius = pyqtProperty(int, _get_pill_radius, _set_pill_radius)
@@ -365,8 +383,15 @@ class CustomCalendar(QCalendarWidget):
     pillinsety = pyqtProperty(int, _get_inset_y, _set_inset_y)
     othermonthcolor = pyqtProperty(QColor, _get_other_month_color, _set_other_month_color)
     selectedcolor = pyqtProperty(QColor, _get_selected_color, _set_selected_color)
+    selectedtextcolor = pyqtProperty(QColor, _get_selected_text_color, _set_selected_text_color)
 
     def eventFilter(self, obj, event):
+        if self._slide is not None and obj is self._hover_viewport and event.type() == QEvent.Type.Wheel:
+            self._on_wheel(event)
+            return True
+        if self._slide is not None and event.type() in (QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress):
+            # The view may change the page on this input (an arrow key, a click on another month's day)
+            self._remember_page()
         if self._hover is not None and obj is self._hover_viewport:
             kind = event.type()
             if kind == QEvent.Type.MouseMove:
@@ -405,6 +430,71 @@ class CustomCalendar(QCalendarWidget):
         if self._hover is not None:
             # Other days now sit under the pointer; the next mouse move finds the right one
             self._hover.reset()
+        if self._slide is not None:
+            old, new = self._shown_key, self._page_key(year, month)
+            self._shown_key = new
+            area = self._dates_area()
+            if old is not None and area is not None and self._slide.has_page(old):
+                snapshot = self._hover_viewport.grab(area)  # paints the new page, so its cells are known
+                first_row = self._first_row()
+                if first_row is not None:
+                    self._slide.keep_page(new, snapshot, first_row)
+                    self._slide.setGeometry(area.translated(self._hover_viewport.mapTo(self, QPoint(0, 0))))
+                    self._slide.go(old, new)
+
+    @staticmethod
+    def _page_key(year: int, month: int) -> int:
+        return year * 12 + month - 1
+
+    def _dates_area(self) -> QRect | None:
+        """The rows of days, under the weekday header, in the view's viewport coordinates."""
+        table_view = self.findChild(QTableView)
+        if table_view is None or self._hover_viewport is None:
+            return None
+        top = table_view.rowViewportPosition(1)
+        height = self._hover_viewport.height() - top
+        if top <= 0 or height <= 0:
+            return None
+        return QRect(0, top, self._hover_viewport.width(), height)
+
+    def _remember_page(self) -> None:
+        """Keep a picture of the page on screen, in case the next input changes the page."""
+        if self._slide is None or self._slide.is_running() or self._shown_key is None:
+            return
+        area = self._dates_area()
+        if area is not None and not self._slide.has_page(self._shown_key):
+            snapshot = self._hover_viewport.grab(area)
+            first_row = self._first_row()
+            if first_row is not None:
+                self._slide.keep_page(self._shown_key, snapshot, first_row)
+
+    def _first_row(self) -> int | None:
+        """The week of the page's first cell, as an absolute row index (pages share it where they overlap)."""
+        if self._hover is None or not self._hover._rects:
+            return None
+        return min(self._hover._rects).toJulianDay() // 7
+
+    def _on_wheel(self, event) -> None:
+        """One month per wheel notch (120); a touchpad's small steps add up to one."""
+        self._wheel_acc += event.angleDelta().y()
+        steps = int(self._wheel_acc / 120)
+        if steps:
+            self._wheel_acc -= steps * 120
+            for _ in range(abs(steps)):
+                self._remember_page()
+                if steps > 0:
+                    self.showPreviousMonth()
+                else:
+                    self.showNextMonth()
+        event.accept()
+
+    def _after_slide(self) -> None:
+        """The new page is in place: light the day now under the pointer."""
+        if self._hover is None or self._hover_viewport is None:
+            return
+        pos = self._hover_viewport.mapFromGlobal(QCursor.pos())
+        if self._hover_viewport.rect().contains(pos):
+            self._hover.set_hovered(self._hover.key_at(pos))
 
     def paintCell(self, painter, rect, date):
         """Custom paint for cells: a hover pill under the day, holiday dates in holiday_color."""
@@ -427,6 +517,18 @@ class CustomCalendar(QCalendarWidget):
             pill = QRectF(rect).adjusted(self._inset_x, self._inset_y, -self._inset_x, -self._inset_y)
             painter.drawRoundedRect(pill, self._pill_radius, self._pill_radius)
             painter.restore()
+        if selected and self._selected_color.alpha() and self._selected_text_color.alpha():
+            # Today's number in its capsule. Qt keeps the selected *cell* when another month is shown, so the
+            # stylesheet's selected look stays plain and the calendar draws today itself.
+            view = self.findChild(QTableView)
+            font = QFont(view.font() if view is not None else self.font())
+            font.setBold(True)
+            painter.save()
+            painter.setFont(font)
+            painter.setPen(self._selected_text_color)
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, str(date.day()))
+            painter.restore()
+            return
         shown = date.month() == self.monthShown() and date.year() == self.yearShown()
         if not shown and self._other_month_color.alpha() and date != self.selectedDate():
             # A day of the month before or after: same number, dimmed
