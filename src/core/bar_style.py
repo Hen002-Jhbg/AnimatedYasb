@@ -1,10 +1,50 @@
 import math
 
-from PyQt6.QtCore import QEvent, QRect, QRectF, Qt, pyqtProperty
+from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, pyqtProperty
 from PyQt6.QtGui import QColor, QPainter, QPainterPath, QPalette, QPen, QTransform
 from PyQt6.QtWidgets import QFrame, QWidget
 
 RESTYLE_EVENTS = frozenset({QEvent.Type.Polish, QEvent.Type.StyleChange})
+
+# Apple's continuous corner (the "squircle" of iOS 7 onwards): the points of its three cubic segments, as
+# distances from the corner in units of the corner's radius, along the edge it starts on and then along
+# the edge it ends on. Its curvature rises and falls gradually instead of jumping straight to a circle's,
+# which is what makes Apple's rounded shapes look soft.
+_CONTINUOUS_CORNER = (
+    (1.52866483, 0.0), (1.08849323, 0.0), (0.86840689, 0.02647561), (0.66993427, 0.06549600),
+    (0.63149399, 0.07491100), (0.37282392, 0.16905899), (0.16905899, 0.37282392), (0.07491100, 0.63149399),
+    (0.06549600, 0.66993427), (0.02647561, 0.86840689), (0.0, 1.08849323), (0.0, 1.52866483),
+)
+
+# An island's side is short (from the rail to the bar's bottom, shared by a fillet and a corner), so a
+# continuous curve cannot be as large up the side as Apple draws them. Along the rail and the bottom, where
+# there is room, it reaches this much further, which gives the long, soft sweep of Apple's notch and
+# Dynamic Island. Spanning only what a circular arc spans made the curves tighter than today's. The theme
+# can tune it as cornerstretch, in percent.
+_CONTINUOUS_STRETCH = 1.5
+
+
+def _continuous_corner(
+    path: QPainterPath, corner_x: float, corner_y: float, start, end, along_start: float, along_end: float
+) -> None:
+    """Round the corner at (corner_x, corner_y) with Apple's continuous curve, from `along_start` along
+    `start` to `along_end` along `end` (unit directions away from the corner). The path must already be
+    at the start point."""
+    radius_start = along_start / _CONTINUOUS_CORNER[0][0]
+    radius_end = along_end / _CONTINUOUS_CORNER[0][0]
+
+    def point(index: int) -> QPointF:
+        on_start, on_end = _CONTINUOUS_CORNER[index]
+        return QPointF(
+            corner_x + on_start * start[0] * radius_start + on_end * end[0] * radius_end,
+            corner_y + on_start * start[1] * radius_start + on_end * end[1] * radius_end,
+        )
+
+    path.cubicTo(point(1), point(2), point(3))
+    path.lineTo(point(4))
+    path.cubicTo(point(5), point(6), point(7))
+    path.lineTo(point(8))
+    path.cubicTo(point(9), point(10), point(11))
 
 
 class BarFrame(QFrame):
@@ -37,7 +77,9 @@ class BarFrame(QFrame):
 class AdaptiveBarFrame(BarFrame):
     """Bar surface for style "adaptive": a rail along the outer edge, each widget group its own
     island by default. Islands and the edge curves are both optional, so this can also render
-    as a plain full-width bar with just its outer corners rounded."""
+    as a plain full-width bar with just its outer corners rounded. With continuouscorners every
+    curve (island corners, the fillets into the rail, the edge curves) is Apple's continuous one
+    instead of a circular arc."""
 
     def __init__(self, parent: QWidget, position: str = "top", exclude: list[str] | None = None):
         super().__init__(parent)
@@ -47,6 +89,8 @@ class AdaptiveBarFrame(BarFrame):
         self._island_radius = 16
         self._group_padding = 8
         self._islands_enabled = True
+        self._continuous_corners = False
+        self._corner_stretch = _CONTINUOUS_STRETCH
         self._edge_radius = 0
         self._edge_curves = False
         self._border_width = 0
@@ -91,6 +135,30 @@ class AdaptiveBarFrame(BarFrame):
         if value == self._islands_enabled:
             return
         self._islands_enabled = value
+        self._update_shape(force=True)
+
+    @pyqtProperty(bool)
+    def continuouscorners(self) -> bool:
+        return self._continuous_corners
+
+    @continuouscorners.setter
+    def continuouscorners(self, value: bool) -> None:
+        if value == self._continuous_corners:
+            return
+        self._continuous_corners = value
+        self._update_shape(force=True)
+
+    @pyqtProperty(int)
+    def cornerstretch(self) -> int:
+        return round(self._corner_stretch * 100)
+
+    @cornerstretch.setter
+    def cornerstretch(self, value: int) -> None:
+        # How much further a continuous curve runs along the rail and the bottom, in percent (100 = none)
+        stretch = max(100, int(value)) / 100
+        if stretch == self._corner_stretch:
+            return
+        self._corner_stretch = stretch
         self._update_shape(force=True)
 
     @pyqtProperty(int)
@@ -230,7 +298,8 @@ class AdaptiveBarFrame(BarFrame):
         if not edges:
             return self.rect()
 
-        margin = self._island_radius + 2
+        # A continuous curve reaches further along the rail than a circular one
+        margin = math.ceil(self._island_radius * (self._corner_stretch if self._continuous_corners else 1.0)) + 2
         return QRect(min(edges) - margin, 0, max(edges) - min(edges) + 2 * margin, self.height())
 
     def _island_spans(self) -> tuple[tuple[int, int], ...]:
@@ -320,6 +389,21 @@ class AdaptiveBarFrame(BarFrame):
         radius = min(float(self._island_radius), max(0.0, (height - rail) / 2))
 
         path = QPainterPath()
+        # With continuous corners a curve also runs further along the rail and the bottom than up the side
+        stretch = self._corner_stretch if self._continuous_corners else 1.0
+
+        def round_corner(corner_x, corner_y, start, end, along_start, along_end, arc, start_angle, sweep):
+            # Apple's continuous curve over the corner when the theme asks for it, else today's circular arc
+            if self._continuous_corners:
+                _continuous_corner(path, corner_x, corner_y, start, end, along_start, along_end)
+            else:
+                path.arcTo(arc, start_angle, sweep)
+
+        def edge_span(x0, x1, corner_along):
+            # How far an edge curve runs along the bar's bottom: never past the island's other corner
+            room = (x1 - x0) / 2 if x0 <= 0.0 and x1 >= width else (x1 - x0) - corner_along
+            return min(overhang * stretch, max(overhang, room))
+
         path.moveTo(0.0, 0.0)
         path.lineTo(width, 0.0)
 
@@ -328,11 +412,15 @@ class AdaptiveBarFrame(BarFrame):
             x0 = float(islands[index][0])
             x1 = float(islands[index][1])
             corner = min(radius, (x1 - x0) / 2)
+            corner_along = min(corner * stretch, (x1 - x0) / 2)
 
             if x1 >= width:
                 if overhang > 0.0:
                     path.lineTo(width, height + overhang)
-                    path.arcTo(QRectF(width - 2 * overhang, height, 2 * overhang, 2 * overhang), 0.0, 90.0)
+                    round_corner(
+                        width, height, (0.0, 1.0), (-1.0, 0.0), overhang, edge_span(x0, x1, corner_along),
+                        QRectF(width - 2 * overhang, height, 2 * overhang, 2 * overhang), 0.0, 90.0,
+                    )
                 else:
                     path.lineTo(width, height)
             else:
@@ -340,28 +428,46 @@ class AdaptiveBarFrame(BarFrame):
                     path.lineTo(width, rail)
                 next_start = float(islands[index + 1][0]) if index < last else width
                 fillet = min(radius, (next_start - x1) / 2)
-                path.lineTo(x1 + fillet, rail)
+                fillet_along = min(fillet * stretch, (next_start - x1) / 2)
+                path.lineTo(x1 + fillet_along, rail)
                 if fillet > 0.0:
-                    path.arcTo(QRectF(x1, rail, 2 * fillet, 2 * fillet), 90.0, 90.0)
+                    round_corner(
+                        x1, rail, (1.0, 0.0), (0.0, 1.0), fillet_along, fillet,
+                        QRectF(x1, rail, 2 * fillet, 2 * fillet), 90.0, 90.0,
+                    )
                 path.lineTo(x1, height - corner)
                 if corner > 0.0:
-                    path.arcTo(QRectF(x1 - 2 * corner, height - 2 * corner, 2 * corner, 2 * corner), 0.0, -90.0)
+                    round_corner(
+                        x1, height, (0.0, -1.0), (-1.0, 0.0), corner, corner_along,
+                        QRectF(x1 - 2 * corner, height - 2 * corner, 2 * corner, 2 * corner), 0.0, -90.0,
+                    )
 
             if x0 <= 0.0:  # closeSubpath draws this side
                 if overhang > 0.0:
-                    path.lineTo(overhang, height)
-                    path.arcTo(QRectF(0.0, height, 2 * overhang, 2 * overhang), 90.0, 90.0)
+                    overhang_along = edge_span(x0, x1, corner_along)
+                    path.lineTo(overhang_along, height)
+                    round_corner(
+                        0.0, height, (1.0, 0.0), (0.0, 1.0), overhang_along, overhang,
+                        QRectF(0.0, height, 2 * overhang, 2 * overhang), 90.0, 90.0,
+                    )
                 else:
                     path.lineTo(0.0, height)
             else:
-                path.lineTo(x0 + corner, height)
+                path.lineTo(x0 + corner_along, height)
                 if corner > 0.0:
-                    path.arcTo(QRectF(x0, height - 2 * corner, 2 * corner, 2 * corner), 270.0, -90.0)
+                    round_corner(
+                        x0, height, (1.0, 0.0), (0.0, -1.0), corner_along, corner,
+                        QRectF(x0, height - 2 * corner, 2 * corner, 2 * corner), 270.0, -90.0,
+                    )
                 previous_end = float(islands[index - 1][1]) if index > 0 else 0.0
                 fillet = min(radius, (x0 - previous_end) / 2)
+                fillet_along = min(fillet * stretch, (x0 - previous_end) / 2)
                 path.lineTo(x0, rail + fillet)
                 if fillet > 0.0:
-                    path.arcTo(QRectF(x0 - 2 * fillet, rail, 2 * fillet, 2 * fillet), 0.0, 90.0)
+                    round_corner(
+                        x0, rail, (0.0, 1.0), (-1.0, 0.0), fillet, fillet_along,
+                        QRectF(x0 - 2 * fillet, rail, 2 * fillet, 2 * fillet), 0.0, 90.0,
+                    )
                 if index == 0:
                     path.lineTo(0.0, rail)
 
