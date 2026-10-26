@@ -125,6 +125,95 @@ def animations_enabled() -> bool:
     return bool(enabled.value) if ok else True
 
 
+class _UnsignedRatio(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [("numerator", ctypes.c_uint32), ("denominator", ctypes.c_uint32)]
+
+
+class _DwmTimingInfo(ctypes.Structure):
+    """DWM_TIMING_INFO from dwmapi.h (packed to 1 byte); only the vblank grid is read."""
+
+    _pack_ = 1
+    _fields_ = [
+        ("cbSize", ctypes.c_uint32), ("rateRefresh", _UnsignedRatio), ("qpcRefreshPeriod", ctypes.c_uint64),
+        ("rateCompose", _UnsignedRatio), ("qpcVBlank", ctypes.c_uint64), ("cRefresh", ctypes.c_uint64),
+        ("cDXRefresh", ctypes.c_uint32), ("qpcCompose", ctypes.c_uint64), ("cFrame", ctypes.c_uint64),
+        ("cDXPresent", ctypes.c_uint32), ("cRefreshFrame", ctypes.c_uint64), ("cFrameSubmitted", ctypes.c_uint64),
+        ("cDXPresentSubmitted", ctypes.c_uint32), ("cFrameConfirmed", ctypes.c_uint64),
+        ("cDXPresentConfirmed", ctypes.c_uint32), ("cRefreshConfirmed", ctypes.c_uint64),
+        ("cDXRefreshConfirmed", ctypes.c_uint32), ("cFramesLate", ctypes.c_uint64),
+        ("cFramesOutstanding", ctypes.c_uint32), ("cFrameDisplayed", ctypes.c_uint64),
+        ("qpcFrameDisplayed", ctypes.c_uint64), ("cRefreshFrameDisplayed", ctypes.c_uint64),
+        ("cFrameComplete", ctypes.c_uint64), ("qpcFrameComplete", ctypes.c_uint64),
+        ("cFramePending", ctypes.c_uint64), ("qpcFramePending", ctypes.c_uint64),
+        ("cFramesDisplayed", ctypes.c_uint64), ("cFramesComplete", ctypes.c_uint64),
+        ("cFramesPending", ctypes.c_uint64), ("cFramesAvailable", ctypes.c_uint64),
+        ("cFramesDropped", ctypes.c_uint64), ("cFramesMissed", ctypes.c_uint64),
+        ("cRefreshNextDisplayed", ctypes.c_uint64), ("cRefreshNextPresented", ctypes.c_uint64),
+        ("cRefreshesDisplayed", ctypes.c_uint64), ("cRefreshesPresented", ctypes.c_uint64),
+        ("cRefreshStarted", ctypes.c_uint64), ("cPixelsReceived", ctypes.c_uint64),
+        ("cPixelsDrawn", ctypes.c_uint64), ("cBuffersEmpty", ctypes.c_uint64),
+    ]
+
+
+# Time a paint needs before the vblank whose composition should pick it up
+_PRESENT_MARGIN_MS = 2.0
+# How long one read of the vblank grid is reused (DWM's period is exact, so the grid holds)
+_VBLANK_REFRESH_MS = 250.0
+_qpc_freq = ctypes.c_int64(0)
+_vblank = {"at_ms": -1e9, "vblank_ms": 0.0, "period_ms": 0.0}
+
+
+def _qpc_ms() -> float:
+    """QueryPerformanceCounter in milliseconds (DWM's own clock)."""
+    if not _qpc_freq.value:
+        ctypes.windll.kernel32.QueryPerformanceFrequency(ctypes.byref(_qpc_freq))
+    now = ctypes.c_int64()
+    ctypes.windll.kernel32.QueryPerformanceCounter(ctypes.byref(now))
+    return now.value * 1000.0 / _qpc_freq.value
+
+
+def _read_vblank(now: float) -> None:
+    if now - _vblank["at_ms"] < _VBLANK_REFRESH_MS:
+        return
+    _vblank["at_ms"] = now
+    info = _DwmTimingInfo()
+    info.cbSize = ctypes.sizeof(_DwmTimingInfo)
+    try:
+        ok = ctypes.windll.dwmapi.DwmGetCompositionTimingInfo(None, ctypes.byref(info)) == 0
+    except Exception:
+        ok = False
+    if ok and info.qpcRefreshPeriod > 0 and _qpc_freq.value:
+        _vblank["vblank_ms"] = info.qpcVBlank * 1000.0 / _qpc_freq.value
+        _vblank["period_ms"] = info.qpcRefreshPeriod * 1000.0 / _qpc_freq.value
+    else:
+        _vblank["period_ms"] = 0.0
+
+
+def frame_period_ms() -> float:
+    """The display's refresh period, from DWM (0 when it is not known)."""
+    _read_vblank(_qpc_ms())
+    return _vblank["period_ms"]
+
+
+def frame_time_ms() -> float:
+    """When the frame a paint started now reaches the screen: the first vblank at least _PRESENT_MARGIN_MS
+    away, on DWM's grid (QPC milliseconds). Without DWM timing it is simply now.
+
+    Springs step to this time instead of the ticker's. The ticker runs at 2/3 of the frame time so that
+    every frame gets a tick, which puts one tick or two in each frame in turn; stepping by the ticker's
+    time moved a fast slide 5, 2, 5, 2 px per frame. Stepping by the frame's own time moves it by exactly
+    one refresh period each frame, as Apple's display link does, and a second tick in the same frame
+    changes nothing.
+    """
+    now = _qpc_ms()
+    _read_vblank(now)
+    period = _vblank["period_ms"]
+    if period <= 0:
+        return now
+    return _vblank["vblank_ms"] + math.ceil((now + _PRESENT_MARGIN_MS - _vblank["vblank_ms"]) / period) * period
+
+
 # Springs in Apple's two terms: response is roughly how long the value takes to reach its target, in
 # seconds, and damping 1.0 settles without overshoot (lower adds a little bounce). Per kind of surface:
 # (entering response, leaving response, damping). Leaving is quicker: it is the interface answering.
@@ -148,6 +237,8 @@ SPRINGS = {
     # A list scrolled by a wheel notch or the arrow keys: Apple's spring for moving things (response 0.4,
     # damping 1.0), the same both ways, keeping its speed
     "scroll": (0.40, 0.40, 1.0),
+    # The wallpaper gallery's cards sliding along (SpringMotion: critically damped, its damping is always 1.0)
+    "carousel": (0.30, 0.30, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
@@ -272,7 +363,9 @@ class SpringGroup(QObject):
             self._hold = hold
             self._wait.start()
             self._clock.start()
-            self._last_ms = 0
+            # Stepped by the display's frames (frame_time_ms), as if it began on the previous frame, so the
+            # very next frame already moves
+            self._last_ms = frame_time_ms() - frame_period_ms()
             self._timer.setInterval(tick_interval_ms(self._widget))
             self._timer.start()
 
@@ -282,7 +375,7 @@ class SpringGroup(QObject):
         self.velocities = [0.0] * len(self.values)
 
     def _tick(self) -> None:
-        now = self._clock.elapsed()
+        now = frame_time_ms()
         if self._hold is not None:
             if self._hold() and self._wait.elapsed() < _FIRST_PAINT_WAIT_MS:
                 self._last_ms = now
@@ -1213,9 +1306,11 @@ class SpringMotion(QObject):
     valueChanged = pyqtSignal(float)
     finished = pyqtSignal()
 
-    def __init__(self, widget: QWidget, response: float, precision: float = 0.001):
+    def __init__(self, widget: QWidget, response: float = 0.3, precision: float = 0.001, surface: str | None = None):
         super().__init__(widget)
         self._widget = widget
+        # With a surface, the response comes from SPRINGS (and motion-tuning.json) at each move
+        self._surface = surface
         self._omega = 2.0 * math.pi / response
         self._precision = precision
         self._clock = QElapsedTimer()
@@ -1248,6 +1343,9 @@ class SpringMotion(QObject):
             self._value = float(start)
             self._velocity = 0.0
         self._target = float(target)
+        if self._surface is not None:
+            response, _damping = spring_params(self._surface)
+            self._omega = 2.0 * math.pi / response
         if not animations_enabled():
             self.stop()
             self._set(self._target)
@@ -1256,14 +1354,18 @@ class SpringMotion(QObject):
         if not self.is_running():
             self._timer.setInterval(tick_interval_ms(self._widget))
             self._ticks = 0
-            self._last_ms = 0
+            # Stepped by the display's frames, as SpringGroup is
+            self._last_ms = frame_time_ms() - frame_period_ms()
             self._clock.start()
             self._timer.start()
 
     def _tick(self) -> None:
+        frame = frame_time_ms()
+        dt = (frame - self._last_ms) / 1000.0
+        if dt <= 0:
+            return  # a second tick in the same frame: that frame already has its step
+        self._last_ms = frame
         now = self._clock.elapsed()
-        dt = (now - self._last_ms) / 1000.0
-        self._last_ms = now
         self._ticks += 1
         # Exact critically damped step from the current offset and velocity (stable for any dt)
         w = self._omega

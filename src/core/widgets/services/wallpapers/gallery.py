@@ -31,10 +31,6 @@ from core.widgets.services.wallpapers.manager import WallpaperManager
 FADE_IN_DURATION = 150
 FADE_OUT_DURATION = 100
 
-# Carousel spring, critically damped (no overshoot): how long one step takes, in seconds. Holding an
-# arrow key keeps the cards gliding, because the spring keeps its speed when the target moves on.
-CARD_SPRING_RESPONSE = 0.3
-
 # Windows hit tests a translucent window per pixel, so a fully transparent gap
 # is clicked through. One step of alpha catches the click instead.
 CLICK_ALPHA = 1
@@ -203,7 +199,9 @@ class CardsView(QWidget):
         self.hovered: int | None = None
         self.hit_areas: list[tuple[int, QPolygonF]] = []
 
-        self.animation = SpringMotion(self, CARD_SPRING_RESPONSE)
+        # The "carousel" spring (motion.SPRINGS), critically damped: holding an arrow key keeps the cards
+        # gliding, because the spring keeps its speed when the target moves on
+        self.animation = SpringMotion(self, surface="carousel")
         self.animation.valueChanged.connect(self._on_animation_value)
         self.animation.finished.connect(self._on_animation_finished)
 
