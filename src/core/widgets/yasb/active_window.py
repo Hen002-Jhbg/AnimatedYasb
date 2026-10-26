@@ -1,4 +1,5 @@
 import atexit
+import ctypes
 import logging
 import os
 import re
@@ -14,6 +15,8 @@ from core.events.service import EventService
 from core.events.win32 import WinEvent
 from core.utils.motion import WidthReveal
 from core.utils.win32.app_icons import get_window_icon
+from core.utils.win32.bindings import DwmGetWindowAttribute
+from core.utils.win32.constants import DWMWA_CLOAKED
 from core.utils.win32.utils import get_app_name_from_aumid, get_app_name_from_pid, get_hwnd_info, get_monitor_hwnd
 from core.validation.widgets.yasb.active_window import ActiveWindowConfig
 from core.widgets.base import BaseWidget
@@ -38,6 +41,16 @@ try:
 except ImportError:
     SystemEventListener = None
     logging.warning("Failed to load Win32 System Event Listener")
+
+
+def _is_cloaked(hwnd: int) -> bool:
+    """A window komorebi hid on another workspace (DWM cloaked) can still be the foreground one for a moment."""
+    try:
+        cloaked = ctypes.c_uint(0)
+        res = DwmGetWindowAttribute(int(hwnd), DWMWA_CLOAKED, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+        return res == 0 and cloaked.value > 0
+    except Exception:
+        return False
 
 
 class ActiveWindowWidget(BaseWidget):
@@ -169,7 +182,7 @@ class ActiveWindowWidget(BaseWidget):
     def _on_focus_change_workspaces(self, event: str) -> None:
         # Temporary fix for MoveWindow event from Komorebi: MoveWindow event is not sending enough data to know on which monitor the window is being moved also animation is a problem and because of that we are using singleShot to try catch the window after the animation is done and this will run only on MoveWindow event
         if event in ["Hide", "Destroy"]:
-            self._reveal.close()
+            self._follow_foreground_or_close()
             return
         hwnd = win32gui.GetForegroundWindow()
         if hwnd != 0:
@@ -182,6 +195,22 @@ class ActiveWindowWidget(BaseWidget):
                 self._update_retry_count = 0
         else:
             self._set_no_window_or_hide()
+
+    def _follow_foreground_or_close(self) -> None:
+        """Komorebi hid or closed a window. It says so after Windows has already focused the next one, so
+        show that window when there is one (as _on_window_destroy_event does) instead of hiding the title;
+        a window closed in the background keeps the focused window's title."""
+        fg = win32gui.GetForegroundWindow()
+        if fg and not _is_cloaked(fg):
+            try:
+                fg_info = get_hwnd_info(fg)
+            except Exception:
+                fg_info = None
+            process = fg_info.get("process") if fg_info else None
+            if fg_info and fg_info.get("title") and isinstance(process, dict) and process.get("pid") != CURRENT_PROCESS_ID:
+                self._on_focus_change_event(fg, WinEvent.WinEventOutOfContext)
+                return
+        self._reveal.close()
 
     def _on_window_destroy_event(self, hwnd: int, event: WinEvent) -> None:
         """Handle top-level window destruction. Only react when the destroyed HWND matches the tracked window."""
