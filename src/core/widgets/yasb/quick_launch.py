@@ -36,6 +36,7 @@ from PyQt6.QtWidgets import (
 )
 
 from core.ui.components.loader import LoaderLine
+from core.utils.motion import SmoothScroll
 from core.utils.system import app_data_path
 from core.utils.utilities import PopupWidget
 from core.utils.win32.utils import apply_qmenu_style, find_focused_screen
@@ -372,7 +373,26 @@ class ResultItemDelegate(QStyledItemDelegate):
 
 
 class ResultListView(QListView):
-    """QListView subclass with custom drag support for result items."""
+    """QListView subclass with custom drag support for result items, and smooth scrolling."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The wheel, the arrow keys and the jump back to the top glide on a spring (see SmoothScroll)
+        self._smooth = SmoothScroll(self)
+
+    def wheelEvent(self, event):
+        if not event.pixelDelta().isNull() or abs(event.angleDelta().y()) < 120:
+            # A touchpad's (or a free-spinning wheel's) small steps come many per second: follow them 1:1
+            self._smooth.stop()
+            super().wheelEvent(event)
+            return
+        self._smooth.glide(lambda: super(ResultListView, self).wheelEvent(event))
+
+    def scrollTo(self, index, hint=QListView.ScrollHint.EnsureVisible):
+        self._smooth.glide(lambda: super(ResultListView, self).scrollTo(index, hint))
+
+    def scrollToTop(self):
+        self._smooth.glide(lambda: super(ResultListView, self).scrollToTop())
 
     def startDrag(self, supportedActions):
         index = self.currentIndex()

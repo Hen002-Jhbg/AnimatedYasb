@@ -35,7 +35,7 @@ from PyQt6.QtCore import (
     pyqtSignal,
 )
 from PyQt6.QtGui import QColor, QCursor, QLinearGradient, QPainter, QPixmap
-from PyQt6.QtWidgets import QApplication, QFrame, QWidget
+from PyQt6.QtWidgets import QAbstractScrollArea, QApplication, QFrame, QWidget
 
 POPUP_ENTER_MS = 200
 POPUP_EXIT_MS = 150
@@ -145,6 +145,8 @@ SPRINGS = {
     # A calendar's months scrolling by: one slow, soft spring both ways (felt better than 0.30 and 0.45),
     # keeping its speed through a fast wheel spin
     "calendar": (0.60, 0.60, 1.0),
+    # A list scrolled by a wheel notch or the arrow keys: one spring both ways, keeping its speed
+    "scroll": (0.30, 0.30, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
@@ -638,6 +640,79 @@ class WidthReveal(QObject):
             callback, self._on_closed = self._on_closed, None
             if callback is not None:
                 callback()
+
+
+class SmoothScroll(QObject):
+    """Glides a scroll area's vertical position on a spring instead of jumping, Apple-style.
+
+    glide(move) lets move() scroll the bar the way Qt would (a wheel notch, scrollTo() for a selection the
+    keyboard moved off screen), starting from where the glide is already heading, then puts the bar back
+    and glides there. Another notch or key press mid-way only moves the target and keeps the speed, so a
+    fast wheel spin or a held arrow key flows instead of stepping. Anything else that moves the bar (a drag
+    on the scroll bar, a new list) stops the glide where it is. With Windows "Animation effects" off, or
+    while the view is not on screen, it jumps.
+    """
+
+    def __init__(self, view: QAbstractScrollArea):
+        super().__init__(view)
+        self._view = view
+        self._bar = view.verticalScrollBar()
+        self._applying = False
+        self._spring = SpringGroup(view, 1)
+        self._spring.changed.connect(self._apply)
+        self._bar.valueChanged.connect(self._on_value_changed)
+        self._bar.sliderPressed.connect(self.stop)
+
+    def is_running(self) -> bool:
+        return self._spring.is_running()
+
+    def target(self) -> int:
+        """Where the bar is heading (where it is, at rest)."""
+        return round(self._spring.targets[0]) if self.is_running() else self._bar.value()
+
+    def glide(self, move: Callable[[], None]) -> None:
+        """Glide to where move() would put the bar, as computed from where the glide is heading."""
+        bar = self._bar
+        shown = bar.value()
+        self._applying = True
+        try:
+            bar.setValue(self.target())
+            move()
+            target = bar.value()
+            bar.setValue(shown)
+        finally:
+            self._applying = False
+        self.scroll_to(target)
+
+    def scroll_to(self, value: int) -> None:
+        bar = self._bar
+        value = max(bar.minimum(), min(bar.maximum(), int(value)))
+        if not animations_enabled() or not self._view.isVisible():
+            self.stop()
+            bar.setValue(value)
+            return
+        if not self.is_running():
+            if value == bar.value():
+                return
+            self._spring.jump([float(bar.value())])
+        response, damping = spring_params("scroll")
+        self._spring.animate([float(value)], response, damping, [0.5])
+
+    def stop(self) -> None:
+        """Stop where it is."""
+        self._spring.stop()
+
+    def _apply(self) -> None:
+        self._applying = True
+        try:
+            self._bar.setValue(round(self._spring.values[0]))
+        finally:
+            self._applying = False
+
+    def _on_value_changed(self, _value: int) -> None:
+        if not self._applying and self.is_running():
+            # Something else moved the bar (a drag on it, a new list): stop the glide there
+            self._spring.stop()
 
 
 class HoverPillFrame(QFrame):
