@@ -489,8 +489,9 @@ class WidthReveal(QObject):
     Opening shows the widget at zero width and grows it to its natural width; closing shrinks it to
     zero and then hides it (with hide_when_closed=False it stays shown at zero width instead: the audio
     visualizer must keep getting show and hide events). While it is open, a change of its natural
-    width animates too (a new media title, a longer count): the width is held where it is and moves to
-    the new size. All of these turn around mid-way from the current width. A widget that is not on
+    width animates too (a new media title, a longer count, a button or icon shown or hidden inside):
+    the width is held where it is and moves to the new size. All of these turn around mid-way from the
+    current width. A widget that is not on
     screen jumps, and so does everything with Windows "Animation effects" off.
     """
 
@@ -503,6 +504,7 @@ class WidthReveal(QObject):
         self._target = 0.0
         self._min_width = widget.minimumWidth()
         self._on_closed: Callable[[], None] | None = None
+        self._applying = False
         self._motion = ValueMotion(widget, "width", precision=0.5)
         self._motion.valueChanged.connect(self._apply)
         self._motion.finished.connect(self._on_finished)
@@ -512,11 +514,28 @@ class WidthReveal(QObject):
         return self._open
 
     def eventFilter(self, obj, event) -> bool:
-        # The content changed size: this arrives before the widget is re-laid out, so the width can be
-        # held where it is and moved to the new size instead of jumping there
-        if obj is self._widget and event.type() == QEvent.Type.LayoutRequest:
-            self._follow_content()
+        if obj is self._widget:
+            kind = event.type()
+            if kind == QEvent.Type.LayoutRequest:
+                # The content changed size: this arrives before the widget is re-laid out, so the width can
+                # be held where it is and moved to the new size instead of jumping there
+                self._follow_content()
+            elif kind == QEvent.Type.Resize:
+                self._catch_jump(event)
         return False
+
+    def _catch_jump(self, event) -> None:
+        """A child shown inside (a new button, a tray icon) re-lays the bar out at once, with no LayoutRequest
+        first, so the widget is already at its new width: put it back at the old one and move from there.
+        The bar repaints only after the re-layout this queues, so the jump is never seen."""
+        if self._applying or not self._open or self._motion.is_running() or not self._widget.isVisible():
+            return
+        old, new = event.oldSize().width(), event.size().width()
+        if old <= 0 or abs(new - old) < 1:
+            return
+        target = self._natural()
+        if abs(target - old) >= 1:
+            self._run(float(old), target)
 
     def open(self) -> None:
         """Grow to the natural width, showing the widget first."""
@@ -584,7 +603,12 @@ class WidthReveal(QObject):
         # Both limits: a maximum alone cannot hold a widget whose content just got narrower
         limit = max(0, round(width))
         if self._widget.minimumWidth() != limit or self._widget.maximumWidth() != limit:
-            self._widget.setFixedWidth(limit)
+            # Its own resize, even the last frame's (the ticker has stopped by then): not a jump to catch
+            self._applying = True
+            try:
+                self._widget.setFixedWidth(limit)
+            finally:
+                self._applying = False
 
     def _on_finished(self) -> None:
         if self._open and abs(self._natural() - self._width) >= 1:

@@ -6,7 +6,7 @@ from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QImage, QPixmap, QWheelEvent
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QWidget
 
-from core.utils.motion import COLLAPSE_MS, EXPAND_MS, ValueMotion
+from core.utils.motion import COLLAPSE_MS, EXPAND_MS, ValueMotion, WidthReveal
 from core.utils.qobject import is_valid_qobject
 from core.utils.tooltip import CustomToolTip, set_tooltip
 from core.utils.utilities import (
@@ -57,6 +57,8 @@ class VolumeWidget(BaseWidget):
 
         self.volume = self._service.get_volume_interface()
         self._update_label()
+        # A level with more or fewer digits changes the width smoothly, so the widgets after it slide
+        self._reveal = WidthReveal(self)
 
     def _reinitialize_audio(self):
         """Update volume interface reference after device change."""

@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayou
 
 from core.events.komorebi import KomorebiEvent
 from core.events.service import EventService
+from core.utils.motion import WidthReveal
 from core.utils.utilities import PopupWidget
 from core.utils.win32.utils import get_monitor_hwnd
 from core.validation.widgets.komorebi.active_layout import ActiveLayoutConfig
@@ -91,6 +92,9 @@ class ActiveLayoutWidget(BaseWidget):
 
         self._register_signals_and_events()
         self.hide()
+        # Shown when komorebi connects: it opens and closes by its width, and a new layout name changes
+        # it smoothly, so the widgets after it slide instead of jumping
+        self._reveal = WidthReveal(self, is_open=False)
 
     def _toggle_layout_menu(self):
         self._show_layout_menu()
@@ -266,15 +270,14 @@ class ActiveLayoutWidget(BaseWidget):
 
     def _on_komorebi_connect_event(self, state: dict) -> None:
         self._update_active_layout(state, is_connect_event=True)
-        if self.isHidden():
-            self.show()
+        self._reveal.open()
 
     def _on_komorebi_layout_change_event(self, _event: dict, state: dict) -> None:
         self._update_active_layout(state)
 
     def _on_komorebi_disconnect_event(self) -> None:
         if self.config.hide_if_offline:
-            self.hide()
+            self._reveal.close()
 
     def _update_active_layout(self, state: dict, is_connect_event=False):
         try:
@@ -298,7 +301,7 @@ class ActiveLayoutWidget(BaseWidget):
                 )
 
                 if self._active_layout_text.isHidden():
-                    self.show()
+                    self._reveal.open()
         except Exception:
             logging.exception("Failed to update komorebi status and widget button state")
 

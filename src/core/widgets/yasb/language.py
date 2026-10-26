@@ -9,6 +9,7 @@ from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout
 from win32con import WM_INPUTLANGCHANGEREQUEST
 
+from core.utils.motion import WidthReveal
 from core.utils.utilities import PopupWidget, refresh_widget_style
 from core.utils.win32.bindings import (
     kernel32,
@@ -62,6 +63,8 @@ class LanguageWidget(BaseWidget):
 
         # Caps Lock state
         self._caps_lock_active = False
+        # The short and long labels (right click) and a new language change the width smoothly
+        self._reveal = WidthReveal(self)
 
         self.start_timer()
 

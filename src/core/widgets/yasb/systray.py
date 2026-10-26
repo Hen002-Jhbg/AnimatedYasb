@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 from win32con import HWND_BROADCAST
 
 from core.bar_helper import AppBarManager
+from core.utils.motion import WidthReveal
 from core.utils.system import app_data_path
 from core.utils.utilities import AnimatedContextMenu, refresh_widget_style
 from core.utils.win32.bindings import IsWindow
@@ -221,6 +222,9 @@ class SystrayWidget(BaseWidget):
             self.unpinned_vis_btn.setVisible(self.config.show_unpinned_button)
 
         self.widget_layout.addWidget(self.widget_container)
+        # Icons arriving or leaving and the unpinned icons opening change the width smoothly, so the
+        # widgets after it slide instead of jumping
+        self._reveal = WidthReveal(self)
 
         if self.config.use_hook:
             self.setup_client()

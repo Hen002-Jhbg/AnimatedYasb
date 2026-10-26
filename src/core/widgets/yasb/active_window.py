@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import QLabel, QWidget
 
 from core.events.service import EventService
 from core.events.win32 import WinEvent
+from core.utils.motion import WidthReveal
 from core.utils.win32.app_icons import get_window_icon
 from core.utils.win32.utils import get_app_name_from_aumid, get_app_name_from_pid, get_hwnd_info, get_monitor_hwnd
 from core.validation.widgets.yasb.active_window import ActiveWindowConfig
@@ -58,6 +59,8 @@ class ActiveWindowWidget(BaseWidget):
         self._event_service = EventService()
         self._update_retry_count = 0
         self._init_container()
+        # The title opens, closes and changes size by its width, so the widgets after it slide instead of jumping
+        self._reveal = WidthReveal(self)
 
         self._window_title_text = QLabel()
         self._window_title_text.setProperty("class", "label")
@@ -158,7 +161,7 @@ class ActiveWindowWidget(BaseWidget):
             if self.config.label_icon:
                 self._window_icon_label.hide()
         else:
-            self.hide()
+            self._reveal.close()
 
     def _stop_events(self) -> None:
         self._event_service.clear()
@@ -166,7 +169,7 @@ class ActiveWindowWidget(BaseWidget):
     def _on_focus_change_workspaces(self, event: str) -> None:
         # Temporary fix for MoveWindow event from Komorebi: MoveWindow event is not sending enough data to know on which monitor the window is being moved also animation is a problem and because of that we are using singleShot to try catch the window after the animation is done and this will run only on MoveWindow event
         if event in ["Hide", "Destroy"]:
-            self.hide()
+            self._reveal.close()
             return
         hwnd = win32gui.GetForegroundWindow()
         if hwnd != 0:
@@ -389,8 +392,7 @@ class ActiveWindowWidget(BaseWidget):
 
                 if self._window_title_text.isHidden():
                     self._window_title_text.show()
-                if self.isHidden():
-                    self.show()
+                self._reveal.open()
         except Exception:
             logging.exception(
                 "Failed to update active window title for window with HWND %s emitted by event %s",

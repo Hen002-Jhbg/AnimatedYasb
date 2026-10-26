@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolic
 
 from core.events.komorebi import KomorebiEvent
 from core.events.service import EventService
+from core.utils.motion import WidthReveal
 from core.utils.utilities import refresh_widget_style
 from core.utils.win32.app_icons import get_window_icon
 from core.utils.win32.utils import get_monitor_hwnd, get_process_info
@@ -251,6 +252,9 @@ class WorkspaceWidget(BaseWidget):
         ]
         if self.config.hide_if_offline:
             self.hide()
+        # Komorebi connecting and disconnecting, and workspaces filling or emptying, change the width
+        # smoothly, so the widgets after it slide instead of jumping
+        self._reveal = WidthReveal(self, is_open=not self.config.hide_if_offline)
         # Status text shown when komorebi state can't be retrieved
         self._offline_text = QLabel()
         self._offline_text.setText(self.config.label_offline)
@@ -318,12 +322,14 @@ class WorkspaceWidget(BaseWidget):
         if self._update_komorebi_state(state):
             self._add_or_update_buttons()
         if self.config.hide_if_offline:
-            self.show()
+            self._reveal.open()
 
     def _on_komorebi_disconnect_event(self) -> None:
-        self._show_offline_status()
         if self.config.hide_if_offline:
-            self.hide()
+            # The buttons stay while it closes; the offline text takes their place once it is hidden
+            self._reveal.close(on_closed=self._show_offline_status)
+        else:
+            self._show_offline_status()
 
     def _on_komorebi_update_event(self, event: dict, state: dict) -> None:
         if self._update_komorebi_state(state):
