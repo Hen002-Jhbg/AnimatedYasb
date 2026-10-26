@@ -145,9 +145,9 @@ SPRINGS = {
     # A calendar's months scrolling by: one slow, soft spring both ways (felt better than 0.30 and 0.45),
     # keeping its speed through a fast wheel spin
     "calendar": (0.60, 0.60, 1.0),
-    # A list scrolled by a wheel notch or the arrow keys: one slow, soft spring both ways (felt better than
-    # 0.30 and 0.45, as for the calendar), keeping its speed
-    "scroll": (0.60, 0.60, 1.0),
+    # A list scrolled by a wheel notch or the arrow keys: Apple's spring for moving things (response 0.4,
+    # damping 1.0), the same both ways, keeping its speed
+    "scroll": (0.40, 0.40, 1.0),
 }
 
 # Live tuning while YASB runs: this JSON overrides any surface, for example
