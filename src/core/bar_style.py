@@ -77,9 +77,9 @@ class BarFrame(QFrame):
 class AdaptiveBarFrame(BarFrame):
     """Bar surface for style "adaptive": a rail along the outer edge, each widget group its own
     island by default. Islands and the edge curves are both optional, so this can also render
-    as a plain full-width bar with just its outer corners rounded. With continuouscorners every
-    curve (island corners, the fillets into the rail, the edge curves) is Apple's continuous one
-    instead of a circular arc."""
+    as a plain full-width bar with just its outer corners rounded. With continuouscorners the
+    islands' curves (their corners and the fillets into the rail) are Apple's continuous ones instead
+    of circular arcs; the edge curves stay circular, like the windows' corners they meet."""
 
     def __init__(self, parent: QWidget, position: str = "top", exclude: list[str] | None = None):
         super().__init__(parent)
@@ -399,11 +399,6 @@ class AdaptiveBarFrame(BarFrame):
             else:
                 path.arcTo(arc, start_angle, sweep)
 
-        def edge_span(x0, x1, corner_along):
-            # How far an edge curve runs along the bar's bottom: never past the island's other corner
-            room = (x1 - x0) / 2 if x0 <= 0.0 and x1 >= width else (x1 - x0) - corner_along
-            return min(overhang * stretch, max(overhang, room))
-
         path.moveTo(0.0, 0.0)
         path.lineTo(width, 0.0)
 
@@ -417,10 +412,9 @@ class AdaptiveBarFrame(BarFrame):
             if x1 >= width:
                 if overhang > 0.0:
                     path.lineTo(width, height + overhang)
-                    round_corner(
-                        width, height, (0.0, 1.0), (-1.0, 0.0), overhang, edge_span(x0, x1, corner_along),
-                        QRectF(width - 2 * overhang, height, 2 * overhang, 2 * overhang), 0.0, 90.0,
-                    )
+                    # The edge curves meet the windows' own corners below the bar, which are circular, so
+                    # they stay circular arcs even with continuous corners
+                    path.arcTo(QRectF(width - 2 * overhang, height, 2 * overhang, 2 * overhang), 0.0, 90.0)
                 else:
                     path.lineTo(width, height)
             else:
@@ -444,12 +438,8 @@ class AdaptiveBarFrame(BarFrame):
 
             if x0 <= 0.0:  # closeSubpath draws this side
                 if overhang > 0.0:
-                    overhang_along = edge_span(x0, x1, corner_along)
-                    path.lineTo(overhang_along, height)
-                    round_corner(
-                        0.0, height, (1.0, 0.0), (0.0, 1.0), overhang_along, overhang,
-                        QRectF(0.0, height, 2 * overhang, 2 * overhang), 90.0, 90.0,
-                    )
+                    path.lineTo(overhang, height)
+                    path.arcTo(QRectF(0.0, height, 2 * overhang, 2 * overhang), 90.0, 90.0)
                 else:
                     path.lineTo(0.0, height)
             else:
