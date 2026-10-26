@@ -142,9 +142,9 @@ SPRINGS = {
     "launcher": (0.24, 0.15, 1.0),
     # An auto-hiding bar, revealed under a pointer already waiting at the screen edge: in place sooner
     "autohide": (0.30, 0.24, 1.0),
-    # A calendar's months scrolling by: one slow, soft spring both ways (felt better than 0.30 and 0.45),
-    # keeping its speed through a fast wheel spin
-    "calendar": (0.60, 0.60, 1.0),
+    # A calendar's months scrolling by: Apple's spring for moving things (response 0.4, damping 1.0), the
+    # same both ways, keeping its speed through a fast wheel spin
+    "calendar": (0.40, 0.40, 1.0),
     # A list scrolled by a wheel notch or the arrow keys: Apple's spring for moving things (response 0.4,
     # damping 1.0), the same both ways, keeping its speed
     "scroll": (0.40, 0.40, 1.0),
