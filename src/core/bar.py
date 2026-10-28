@@ -14,6 +14,7 @@ from core.bar_helper import (
     MaximizedWindowWatcher,
     OsThemeManager,
 )
+from core.bar_sections import SectionSpace, SeparatorFolder
 from core.bar_style import AdaptiveBarFrame, BarFrame
 from core.events.service import EventService
 from core.utils.utilities import is_valid_percentage_str, percent_to_float
@@ -115,6 +116,9 @@ class Bar(QWidget):
         self.monitor_hwnd = get_monitor_hwnd(int(self.winId()))
 
         self._add_widgets(widgets)
+        # Separators with nothing to separate fold away; a bar as wide as its content has no room to share
+        self._separator_folder = SeparatorFolder(self, self)
+        self._section_space = None if self._is_auto_width else SectionSpace(self, self)
 
         if self._is_auto_width:
             self._auto_width_manager = AutoWidthManager(self, self)

@@ -591,6 +591,9 @@ class WidthReveal(QObject):
     screen jumps, and so does everything with Windows "Animation effects" off.
     """
 
+    # Opened or closed, as asked (not when the motion ends), so the bar can fold a separator alongside
+    toggled = pyqtSignal(bool)
+
     def __init__(self, widget: QWidget, is_open: bool = True, hide_when_closed: bool = True):
         super().__init__(widget)
         self._widget = widget
@@ -610,6 +613,14 @@ class WidthReveal(QObject):
 
     def is_open(self) -> bool:
         return self._open
+
+    def settled_width(self) -> float:
+        """The width the widget ends at once its motion is over: zero when closed, else its natural width
+        within its own minimum (while a motion holds the limits, the minimum it had before)."""
+        if not self._open:
+            return 0.0
+        minimum = self._min_width if self._holding else self._widget.minimumWidth()
+        return max(float(minimum), self._natural())
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self._widget:
@@ -641,6 +652,7 @@ class WidthReveal(QObject):
         if self._open:
             return
         self._open = True
+        self.toggled.emit(True)
         start = self._width if self._motion.is_running() else 0.0
         if self._hide_when_closed and self._widget.isHidden():
             self._widget.setMaximumWidth(0)
@@ -660,6 +672,7 @@ class WidthReveal(QObject):
             return
         self._open = False
         self._on_closed = on_closed
+        self.toggled.emit(False)
         if not self._widget.isVisible():
             self._motion.stop()
             self._finish()
@@ -670,8 +683,11 @@ class WidthReveal(QObject):
     def set_open(self, is_open: bool) -> None:
         """Jump to open or closed without animating (startup, or a widget that is not on screen)."""
         self._motion.stop()
+        changed = is_open != self._open
         self._open = is_open
         self._finish()
+        if changed:
+            self.toggled.emit(is_open)
 
     def _natural(self) -> float:
         return float(self._widget.sizeHint().width())

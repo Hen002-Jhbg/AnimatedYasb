@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
 from qasync import asyncSlot  # type: ignore
 
 from core.utils.motion import WidthReveal
-from core.utils.text import truncate_text
+from core.utils.text import ElidingLabel, truncate_text
 from core.utils.utilities import (
     PopupWidget,
     ScrollingLabel,
@@ -116,7 +116,8 @@ class MediaWidget(BaseWidget):
                 options=self.config.scrolling_label.model_dump(),
             )
         else:
-            self._label = QLabel(self)
+            # Shortens with "…" when the bar runs out of room (bar_sections); a scrolling label scrolls instead
+            self._label = ElidingLabel(self)
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Label Alt
@@ -127,7 +128,7 @@ class MediaWidget(BaseWidget):
                 options=self.config.scrolling_label.model_dump(),
             )
         else:
-            self._label_alt = QLabel(self)
+            self._label_alt = ElidingLabel(self)
         self._label_alt.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Titles and artists come from any app's media session, and Qt would take a title with an HTML tag

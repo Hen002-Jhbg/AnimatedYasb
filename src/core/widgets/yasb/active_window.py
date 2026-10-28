@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import QLabel, QWidget
 from core.events.service import EventService
 from core.events.win32 import WinEvent
 from core.utils.motion import WidthReveal
-from core.utils.text import truncate_text
+from core.utils.text import ElidingLabel, truncate_text
 from core.utils.win32.app_icons import get_window_icon
 from core.utils.win32.bindings import DwmGetWindowAttribute
 from core.utils.win32.constants import DWMWA_CLOAKED
@@ -76,7 +76,8 @@ class ActiveWindowWidget(BaseWidget):
         # The title opens, closes and changes size by its width, so the widgets after it slide instead of jumping
         self._reveal = WidthReveal(self)
 
-        self._window_title_text = QLabel()
+        # Shortens with "…" when the bar runs out of room, before the centre would have to move (bar_sections)
+        self._window_title_text = ElidingLabel()
         self._window_title_text.setProperty("class", "label")
         self._window_title_text.setTextFormat(Qt.TextFormat.PlainText)
         self._window_title_text.setText(self.config.label_no_window or "")

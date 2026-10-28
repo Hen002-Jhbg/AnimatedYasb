@@ -245,6 +245,8 @@ class TooltipEventFilter(QObject):
             self.show_tooltip()
 
     def show_tooltip(self):
+        if not self.tooltip_text:
+            return  # a label that shows its whole text again has nothing to add (ElidingLabel)
         if not self.tooltip:
             self.tooltip = CustomToolTip.get_or_create_tooltip()
             self.tooltip._position = self.position  # Set position preference

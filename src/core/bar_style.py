@@ -274,6 +274,14 @@ class AdaptiveBarFrame(BarFrame):
         ratio = self.devicePixelRatioF()
         return math.ceil(self.height() * ratio) / ratio if ratio > 0 else float(self.height())
 
+    def island_gap(self) -> int:
+        """The least room between two sections' widgets that keeps their islands apart, corner curves whole
+        and a little of the rail showing between them (bar_sections keeps the sections this far apart)."""
+        if not self._islands_enabled:
+            return 16
+        reach = math.ceil(self._island_radius * (self._corner_stretch if self._continuous_corners else 1.0))
+        return 2 * (self._group_padding + reach) + max(8, self._rail_height * 2)
+
     def _update_shape(self, force: bool = False) -> None:
         islands = self._island_spans()
         if not force and islands == self._islands:
