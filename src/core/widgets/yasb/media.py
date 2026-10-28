@@ -1,4 +1,5 @@
 import ctypes
+import html
 import io
 import logging
 import os
@@ -26,6 +27,7 @@ from PyQt6.QtWidgets import (
 from qasync import asyncSlot  # type: ignore
 
 from core.utils.motion import WidthReveal
+from core.utils.text import truncate_text
 from core.utils.utilities import (
     PopupWidget,
     ScrollingLabel,
@@ -127,6 +129,13 @@ class MediaWidget(BaseWidget):
         else:
             self._label_alt = QLabel(self)
         self._label_alt.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Titles and artists come from any app's media session, and Qt would take a title with an HTML tag
+        # in it ("... a <div>") for markup: only a label template written as markup is rich text
+        self._label_markup = Qt.mightBeRichText(self.config.label)
+        self._label_alt_markup = Qt.mightBeRichText(self.config.label_alt)
+        self._label.setTextFormat(Qt.TextFormat.RichText if self._label_markup else Qt.TextFormat.PlainText)
+        self._label_alt.setTextFormat(Qt.TextFormat.RichText if self._label_alt_markup else Qt.TextFormat.PlainText)
 
         self._thumbnail_label = QLabel(self)
         self._thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -272,6 +281,7 @@ class MediaWidget(BaseWidget):
                     else "Unknown Title"
                 )
                 self._popup_title_label = QLabel(title_text)
+                self._popup_title_label.setTextFormat(Qt.TextFormat.PlainText)
                 self._popup_title_label.setContentsMargins(0, 0, 0, 0)
                 self._popup_title_label.setProperty("class", "title")
                 self._popup_title_label.setWordWrap(True)
@@ -283,6 +293,7 @@ class MediaWidget(BaseWidget):
                     else ""
                 )
                 self._popup_artist_label = QLabel(artist_text)
+                self._popup_artist_label.setTextFormat(Qt.TextFormat.PlainText)
                 self._popup_artist_label.setContentsMargins(0, 0, 0, 0)
                 self._popup_artist_label.setProperty("class", "artist")
                 self._popup_artist_label.setWordWrap(True)
@@ -327,6 +338,7 @@ class MediaWidget(BaseWidget):
                 source_name, source_class_name = self._get_source_app_name()
                 if source_name is not None and self.config.media_menu.show_source:
                     self._popup_source_label = QLabel(source_name)
+                    self._popup_source_label.setTextFormat(Qt.TextFormat.PlainText)
                     self._popup_source_label.setContentsMargins(0, 0, 0, 0)
                     self._popup_source_label.setProperty("class", f"source {source_class_name}")
                     self._popup_source_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -768,6 +780,8 @@ class MediaWidget(BaseWidget):
 
         active_label = self._label_alt if self._show_alt_label else self._label
         active_label_content = self.config.label_alt if self._show_alt_label else self.config.label
+        # In a markup template the session's text goes in escaped, so it still reads as text
+        escape = html.escape if (self._label_alt_markup if self._show_alt_label else self._label_markup) else str
 
         # If we only have controls, stop update here
         if self.config.controls_only:
@@ -782,7 +796,7 @@ class MediaWidget(BaseWidget):
                 )
                 formatted_info: dict[str, str] = {"s": self.config.separator}
                 for k, v in items:
-                    formatted_info[k] = self._format_max_field_size(v)
+                    formatted_info[k] = escape(self._format_max_field_size(v))
 
                 # Clean the label content from any empty placeholders or dangling separators
                 cleaned_content = clean_string(active_label_content, formatted_info)
@@ -796,7 +810,7 @@ class MediaWidget(BaseWidget):
             except Exception as e:
                 logger.error("Error formatting label: %s", e, exc_info=True)
                 if self.current_session and self.current_session.title:
-                    formatted_label = self._format_max_field_size(self.current_session.title)
+                    formatted_label = escape(self._format_max_field_size(self.current_session.title))
                 else:
                     formatted_label = "No media"
             active_label.setText(formatted_label)
@@ -991,7 +1005,7 @@ class MediaWidget(BaseWidget):
             )
 
         if len(text) > max_size:
-            return text[: max_size - 3] + "..."
+            return truncate_text(text, max_size - 3)
         else:
             return text
 

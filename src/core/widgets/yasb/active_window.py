@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import QLabel, QWidget
 from core.events.service import EventService
 from core.events.win32 import WinEvent
 from core.utils.motion import WidthReveal
+from core.utils.text import truncate_text
 from core.utils.win32.app_icons import get_window_icon
 from core.utils.win32.bindings import DwmGetWindowAttribute
 from core.utils.win32.constants import DWMWA_CLOAKED
@@ -406,7 +407,9 @@ class ActiveWindowWidget(BaseWidget):
                     win_info["app_name"] = self._rewrite_filter(win_info["app_name"])
 
                 if self.config.max_length and len(win_info["title"]) > self.config.max_length:
-                    truncated_title = f"{win_info['title'][: self.config.max_length]}{self.config.max_length_ellipsis}"
+                    truncated_title = truncate_text(
+                        win_info["title"], self.config.max_length, self.config.max_length_ellipsis
+                    )
                     win_info["title"] = truncated_title
                     self._window_title_text.setText(self.config.label_no_window or "")
                     if self.config.label_icon:

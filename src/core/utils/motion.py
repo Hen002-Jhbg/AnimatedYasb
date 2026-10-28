@@ -599,6 +599,8 @@ class WidthReveal(QObject):
         self._width = 0.0
         self._target = 0.0
         self._min_width = widget.minimumWidth()
+        # The widget's width limits are this reveal's, from a run's start until _finish gives them back
+        self._holding = False
         self._on_closed: Callable[[], None] | None = None
         self._applying = False
         self._motion = ValueMotion(widget, "width", precision=0.5)
@@ -687,8 +689,11 @@ class WidthReveal(QObject):
             self._run(current, target)
 
     def _run(self, start: float, end: float) -> None:
-        if not self._motion.is_running():
+        # A jump finishes inside start(), so a run can begin while the last one still holds the width;
+        # its fixed width read as the widget's own minimum would keep the widget from ever narrowing
+        if not self._motion.is_running() and not self._holding:
             self._min_width = self._widget.minimumWidth()
+        self._holding = True
         self._target = end
         self._widget.setMinimumWidth(0)
         shrinking = end < start
@@ -714,6 +719,7 @@ class WidthReveal(QObject):
         self._finish()
 
     def _finish(self) -> None:
+        self._holding = False
         if self._open:
             self._width = self._natural()
             self._widget.setMaximumWidth(_NO_SIZE_LIMIT)
