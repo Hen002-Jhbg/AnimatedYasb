@@ -50,7 +50,8 @@ dependencies = [
     "winrt.windows.devices.wifi==3.2.1",
     "winrt.windows.security.credentials==3.2.1",
     "winrt.windows.ui.viewmanagement==3.2.1",
-    "qt-css-engine @ git+https://github.com/Video-Nomad/qt-css-engine@dev",
+    # The release the fork was tested with; the dev branch keeps changing the engine under it
+    "qt-css-engine @ git+https://github.com/Video-Nomad/qt-css-engine@v0.1.4",
 ]
 
 [project.urls]
