@@ -34,7 +34,7 @@ from PyQt6.QtCore import (
     pyqtProperty,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QCursor, QLinearGradient, QPainter, QPixmap
+from PyQt6.QtGui import QBrush, QColor, QCursor, QLinearGradient, QPainter, QPixmap
 from PyQt6.QtWidgets import QAbstractScrollArea, QApplication, QFrame, QWidget
 
 POPUP_ENTER_MS = 200
@@ -1176,9 +1176,11 @@ class PageSlide(QWidget):
     snapshots; its look (dimmed or not) crossfades as the ribbon moves, so the first frame is exactly the
     old page and the last exactly the new one. Another page change mid-way only moves the target and keeps
     the speed, so a fast wheel spin glides through the months, and turning back is smooth. It is a
-    click-through overlay painting snapshots; the widget underneath already shows the new page and takes
-    over when the motion settles. While it moves, the edges fade into the background, so rows slip under
-    the weekday header instead of being cut. With Windows "Animation effects" off the pages crossfade in
+    click-through overlay. The calendar masks its own day rows out while it runs (the grid underneath
+    already shows the new page and must not show through), so the overlay paints the grid's own background
+    brush, then the rows, snapshots of the cells only. While it moves, the rows' edges fade out by alpha, so
+    they slip under the weekday header instead of being cut, whatever the theme puts behind them (an opaque
+    grid, a translucent or a blurred popup). With Windows "Animation effects" off the pages crossfade in
     place instead (nothing moves).
     """
 
@@ -1194,7 +1196,9 @@ class PageSlide(QWidget):
         self._rows = rows_per_page
         # page key -> (snapshot of its rows, absolute index of its first row)
         self._pages: dict = {}
-        self._background = QColor(0, 0, 0, 0)
+        # What the grid paints behind its cells (None for a transparent grid), and the grid's origin here
+        self._backdrop: QBrush | None = None
+        self._backdrop_origin = QPointF(0.0, 0.0)
         self._fade = False
         self._spring = SpringGroup(self, 1)
         self._spring.changed.connect(self.update)
@@ -1204,11 +1208,14 @@ class PageSlide(QWidget):
         return key in self._pages
 
     def keep_page(self, key: int, pixmap: QPixmap, first_row: int) -> None:
-        """A page's snapshot (its rows only) and the absolute index of its first row (weeks)."""
+        """A page's snapshot (its cells only, on a transparent pixmap) and the absolute index of its first row (weeks)."""
         self._pages[key] = (pixmap, int(first_row))
-        if not self._background.alpha() and not pixmap.isNull():
-            # The page's own background, so the overlay is opaque and the edges fade into it
-            self._background = pixmap.toImage().pixelColor(1, 1)
+
+    def set_backdrop(self, brush: QBrush | None, origin: QPointF) -> None:
+        """The grid's own background (None when it has none) and where the grid's origin is in this overlay,
+        so a gradient or a texture lines up with the grid at rest."""
+        self._backdrop = QBrush(brush) if brush is not None else None
+        self._backdrop_origin = QPointF(origin)
 
     def is_running(self) -> bool:
         return self.isVisible() and self._spring.is_running()
@@ -1257,11 +1264,15 @@ class PageSlide(QWidget):
         p = self._spring.values[0]
         row_h = self.height() / self._rows
         pages = sorted((first_row, pixmap) for pixmap, first_row in self._pages.values())
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        painter.fillRect(self.rect(), self._background)
+        # The rows go on a transparent layer first, so their edges can fade by alpha over any background
+        dpr = self.devicePixelRatioF()
+        layer = QPixmap(round(self.width() * dpr), round(self.height() * dpr))
+        layer.setDevicePixelRatio(dpr)
+        layer.fill(Qt.GlobalColor.transparent)
+        rows = QPainter(layer)
+        rows.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         if self._fade:
-            self._paint_crossfade(painter, pages, p, row_h)
+            self._paint_crossfade(rows, pages, p, row_h)
         else:
             top = math.floor(p)
             for row in range(top, top + self._rows + 1):
@@ -1270,19 +1281,25 @@ class PageSlide(QWidget):
                     continue
                 y = (row - p) * row_h
                 first_a, pixmap_a = covering[0]
-                self._draw_row(painter, pixmap_a, row - first_a, y, row_h)
+                self._draw_row(rows, pixmap_a, row - first_a, y, row_h)
                 if len(covering) > 1:
                     first_b, pixmap_b = covering[-1]
                     # The week both months show: its look crossfades as the ribbon moves from one to the other
                     weight = min(1.0, max(0.0, (p - first_a) / (first_b - first_a)))
                     if weight > 0.0:
-                        painter.setOpacity(weight)
-                        self._draw_row(painter, pixmap_b, row - first_b, y, row_h)
-                        painter.setOpacity(1.0)
+                        rows.setOpacity(weight)
+                        self._draw_row(rows, pixmap_b, row - first_b, y, row_h)
+                        rows.setOpacity(1.0)
             # The edges fade in as the rows leave their place and out as they arrive
             strength = min(1.0, abs(self._spring.targets[0] - p) * 2.0)
             if strength > 0.0:
-                self._fade_edges(painter, strength)
+                self._fade_edges(rows, strength)
+        rows.end()
+        painter = QPainter(self)
+        if self._backdrop is not None:
+            painter.setBrushOrigin(self._backdrop_origin)
+            painter.fillRect(self.rect(), self._backdrop)
+        painter.drawPixmap(0, 0, layer)
         painter.end()
 
     def _paint_crossfade(self, painter: QPainter, pages: list, p: float, row_h: float) -> None:
@@ -1301,19 +1318,20 @@ class PageSlide(QWidget):
             painter.drawPixmap(QRectF(self.rect()), above[0][1], QRectF(above[0][1].rect()))
 
     def _fade_edges(self, painter: QPainter, strength: float) -> None:
+        """Fade the rows' top and bottom edges out by alpha; painter draws on the transparent rows layer."""
         band = min(self.EDGE_FADE_PX, self.height() // 4)
-        solid = QColor(self._background)
-        solid.setAlphaF(solid.alphaF() * strength)
-        clear = QColor(self._background)
-        clear.setAlpha(0)
+        edge = QColor(0, 0, 0, round(255 * (1.0 - strength)))
+        inner = QColor(0, 0, 0, 255)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationIn)
         top = QLinearGradient(0.0, 0.0, 0.0, float(band))
-        top.setColorAt(0.0, solid)
-        top.setColorAt(1.0, clear)
+        top.setColorAt(0.0, edge)
+        top.setColorAt(1.0, inner)
         painter.fillRect(QRectF(0.0, 0.0, float(self.width()), float(band)), top)
         bottom = QLinearGradient(0.0, float(self.height() - band), 0.0, float(self.height()))
-        bottom.setColorAt(0.0, clear)
-        bottom.setColorAt(1.0, solid)
+        bottom.setColorAt(0.0, inner)
+        bottom.setColorAt(1.0, edge)
         painter.fillRect(QRectF(0.0, float(self.height() - band), float(self.width()), float(band)), bottom)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
 
 
 class SpringMotion(QObject):

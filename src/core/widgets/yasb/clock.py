@@ -8,8 +8,20 @@ from datetime import date, datetime, timedelta
 from itertools import cycle
 from zoneinfo import ZoneInfo, available_timezones
 
-from PyQt6.QtCore import QDate, QEvent, QLocale, QPoint, QRect, QRectF, Qt, QTimer, pyqtProperty
-from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPalette, QPixmap
+from PyQt6.QtCore import (
+    QDate,
+    QEvent,
+    QItemSelectionModel,
+    QLocale,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    Qt,
+    QTimer,
+    pyqtProperty,
+)
+from PyQt6.QtGui import QColor, QCursor, QFont, QPainter, QPalette, QPixmap, QRegion
 from PyQt6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
@@ -26,6 +38,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableView,
     QVBoxLayout,
+    QWidget,
 )
 
 from core.config import HOME_CONFIGURATION_DIR
@@ -253,6 +266,8 @@ class CustomCalendar(QCalendarWidget):
         # Windows 11-style hover pills on the days, painted under the numbers (see HoverCells)
         self._hover: HoverCells | None = None
         self._hover_viewport = None
+        # The view itself: while the months slide its day rows are masked out, and the wheel over them lands here
+        self._hover_view = None
         self._hover_color = QColor(0, 0, 0, 0)
         self._press_color = QColor(0, 0, 0, 0)
         self._pill_radius = 12
@@ -300,6 +315,7 @@ class CustomCalendar(QCalendarWidget):
             self._hover.hover_color = QColor(self._hover_color)
             self._hover.press_color = QColor(self._press_color)
             self._hover_viewport = viewport
+            self._hover_view = table_view
             table_view.setMouseTracking(True)
             viewport.setMouseTracking(True)
             viewport.installEventFilter(self)
@@ -389,6 +405,10 @@ class CustomCalendar(QCalendarWidget):
         if self._slide is not None and obj is self._hover_viewport and event.type() == QEvent.Type.Wheel:
             self._on_wheel(event)
             return True
+        if self._slide is not None and obj is self._hover_view and event.type() == QEvent.Type.Wheel:
+            # While the months slide, the day rows are masked out, so the wheel over them reaches the view itself
+            self._on_wheel(event)
+            return True
         if self._slide is not None and event.type() in (QEvent.Type.KeyPress, QEvent.Type.MouseButtonPress):
             # The view may change the page on this input (an arrow key, a click on another month's day)
             self._remember_page()
@@ -435,11 +455,22 @@ class CustomCalendar(QCalendarWidget):
             self._shown_key = new
             area = self._dates_area()
             if old is not None and area is not None and self._slide.has_page(old):
-                snapshot = self._hover_viewport.grab(area)  # paints the new page, so its cells are known
+                snapshot = self._snapshot(area)  # paints the new page, so its cells are known
+                if self._sync_selection():
+                    # The theme's selected-day look now sits on the right cell: picture the page again
+                    snapshot = self._snapshot(area)
                 first_row = self._first_row()
                 if first_row is not None:
+                    viewport = self._hover_viewport
                     self._slide.keep_page(new, snapshot, first_row)
-                    self._slide.setGeometry(area.translated(self._hover_viewport.mapTo(self, QPoint(0, 0))))
+                    backdrop = None
+                    if viewport.autoFillBackground():
+                        backdrop = viewport.palette().brush(viewport.backgroundRole())
+                    self._slide.set_backdrop(backdrop, QPointF(0.0, float(-area.top())))
+                    self._slide.setGeometry(area.translated(viewport.mapTo(self, QPoint(0, 0))))
+                    # The grid underneath already shows the new page: mask its day rows out until the slide
+                    # settles, so they never show through, whatever the theme puts behind them
+                    viewport.setMask(QRegion(viewport.rect()).subtracted(QRegion(area)))
                     self._slide.go(old, new)
 
     @staticmethod
@@ -457,13 +488,54 @@ class CustomCalendar(QCalendarWidget):
             return None
         return QRect(0, top, self._hover_viewport.width(), height)
 
+    def _snapshot(self, area: QRect) -> QPixmap:
+        """The day cells in area as the grid paints them, on a transparent pixmap, without the grid's own
+        background: the page slide paints that once, behind the moving rows. While a slide runs the rows
+        are masked out, so the mask is lifted for the moment of the picture."""
+        viewport = self._hover_viewport
+        dpr = viewport.devicePixelRatioF()
+        pixmap = QPixmap(round(area.width() * dpr), round(area.height() * dpr))
+        pixmap.setDevicePixelRatio(dpr)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        mask = viewport.mask()
+        if not mask.isEmpty():
+            viewport.clearMask()
+        # No flags: the viewport's own painting only (its cells), no window background and no children
+        viewport.render(pixmap, QPoint(0, 0), QRegion(area), QWidget.RenderFlag(0))
+        if not mask.isEmpty():
+            viewport.setMask(mask)
+        return pixmap
+
+    def _sync_selection(self) -> bool:
+        """Put the view's selection on the selected day's cell of the page now shown.
+
+        Qt moves it there only after currentPageChanged, so a snapshot taken in that signal would mark the old
+        cell: a theme's ::item:selected look would ride in on the wrong day and jump at the end. Qt does the
+        same right after this, so nothing changes for it. True if the selection moved.
+        """
+        if self._hover is None or self._hover_view is None:
+            return False
+        rect = self._hover._rects.get(self.selectedDate())
+        index = self._hover_view.indexAt(rect.center()) if rect is not None else None
+        selection = self._hover_view.selectionModel()
+        if index is not None and index.isValid():
+            if selection.selectedIndexes() == [index]:
+                return False
+            selection.setCurrentIndex(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            return True
+        if selection.selectedIndexes():
+            # The selected day is not on this page: no cell is selected, as Qt leaves it
+            selection.clearSelection()
+            return True
+        return False
+
     def _remember_page(self) -> None:
         """Keep a picture of the page on screen, in case the next input changes the page."""
         if self._slide is None or self._slide.is_running() or self._shown_key is None:
             return
         area = self._dates_area()
         if area is not None and not self._slide.has_page(self._shown_key):
-            snapshot = self._hover_viewport.grab(area)
+            snapshot = self._snapshot(area)
             first_row = self._first_row()
             if first_row is not None:
                 self._slide.keep_page(self._shown_key, snapshot, first_row)
@@ -489,8 +561,11 @@ class CustomCalendar(QCalendarWidget):
         event.accept()
 
     def _after_slide(self) -> None:
-        """The new page is in place: light the day now under the pointer."""
-        if self._hover is None or self._hover_viewport is None:
+        """The new page is in place: give its day rows back to the grid and light the day under the pointer."""
+        if self._hover_viewport is None:
+            return
+        self._hover_viewport.clearMask()
+        if self._hover is None:
             return
         pos = self._hover_viewport.mapFromGlobal(QCursor.pos())
         if self._hover_viewport.rect().contains(pos):
