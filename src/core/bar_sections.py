@@ -49,6 +49,10 @@ class SectionSpace(QObject):
     the next island. The centre's own texts (the media title) shorten only once even the sides at their
     narrowest could not fit beside it. Budgets come from the widgets' natural widths, not their animated
     ones, so a title that has to shorten slides straight to its new width.
+
+    A bar with no centre widgets has nothing to keep in the middle, so its two sides share the whole width.
+    A centre whose widgets are only hidden for now (no media playing) keeps its half, so a title does not
+    grow and shrink each time they come and go.
     """
 
     def __init__(self, bar_widget: QWidget, parent=None):
@@ -135,6 +139,10 @@ class SectionSpace(QObject):
             return
         (left, left_labels), (centre, centre_labels), (right, right_labels) = map(self._measure, self._containers)
         gap = self._gap()
+        if not _section_widgets(self._containers[1]):
+            # Only a left and a right section: their texts share what both sides leave, less one gap
+            self._give(left_labels + right_labels, width - left - centre - right - gap)
+            return
 
         def least(labels):
             return sum(label.least_width() for label in labels)
